@@ -6,7 +6,7 @@
 
 ;;; =============================================================================
 ;;; MARK: Core Joy Environment
-;;; ===========================================Global symbol environment and data stack for Joy programs==================================
+;;; ========Global symbol environment and data stack for Joy programs============
 
 ;;; Global symbol environment and data stack for Joy programs
 (define joy-env (make-eq-hashtable))
