@@ -1,12 +1,10 @@
 (import (rnrs)
         (rnrs hashtables)
-        (only (chezscheme) format))
+        (only (chezscheme) format command-line-arguments))
 
-(display "Starting Joy interpreter...\n")
-
-;;; =============================================================================
+;;; ==========================================================================
 ;;; MARK: Core Joy Environment
-;;; ========Global symbol environment and data stack for Joy programs============
+;;; ========Global symbol environment and data stack for Joy programs=========
 
 ;;; Global symbol environment and data stack for Joy programs
 (define joy-env (make-eq-hashtable))
@@ -28,9 +26,9 @@
     init
     (fold-left f (f init (car lst)) (cdr lst))))
 
-;;; =============================================================================
+;;; ==========================================================================
 ;;; MARK: Environment and Stack Operations
-;;; =============================================================================
+;;; ==========================================================================
 
 (define (joy-get sym)
   (hashtable-ref joy-env sym '()))
@@ -62,9 +60,9 @@
 (define (joy-push-list! lst)
   (for-each joy-push! (reverse lst)))
 
-;;; =============================================================================
+;;; ===========================================================================
 ;;; MARK: Tokenization and Parsing
-;;; =============================================================================
+;;; ===========================================================================
 
 ;;; Convert a raw token string into a Scheme object:
 ;;; number, boolean, symbol, or quotation bracket
@@ -141,16 +139,14 @@
 
 ;;; Read and parse one line of Joy input from the user
 (define (joy-read-line)
-  (display "> ")
-  (flush-output-port (current-output-port))
   (let ((line (get-line (current-input-port))))
     (if (eof-object? line)
       line
       (joy-tokenize line))))
 
-;;; =============================================================================
+;;; ===========================================================================
 ;;; MARK: Execution Engine
-;;; =============================================================================
+;;; ===========================================================================
 
 ;;; Execute a Joy program (list of tokens)
 (define (joy-exec code)
@@ -177,9 +173,9 @@
     (reverse joy-stack))
   (newline))
 
-;;; =============================================================================
+;;; ===========================================================================
 ;;; MARK: Macro Definitions
-;;; =============================================================================
+;;; ===========================================================================
 
 (define-syntax joy-define
   (syntax-rules ()
@@ -541,7 +537,6 @@
 
 ;;; Start the Joy interactive shell (REPL)
 (define (joy-repl)
-  (display "> ")
   (let ((expr (joy-read-line)))
     (cond
       ((eof-object? expr)
@@ -566,6 +561,15 @@
        "  Examples: square cube factorial sum product"
        "  Use [ ] for quotations, e.g., [1 2 3] [dup *] map")))
 
-;;; Start the REPL
-(display "Type 'help' for available commands.\n")
-(joy-repl)
+;;; Entry point logic
+(let ((args (command-line-arguments)))
+  (cond
+    ((null? args)
+     ;; Default to interactive REPL if stdin is a TTY (roughly)
+     ;; For simplicity, we just check if there's any input to read
+     (display "Joy Interpreter. Type 'help' for commands.\n")
+     (joy-repl))
+    (else
+     ;; In script mode, we could load files, but for now just run
+     ;; This part can be expanded later
+     (joy-repl))))
