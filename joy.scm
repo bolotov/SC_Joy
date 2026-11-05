@@ -1,28 +1,58 @@
 (import (rnrs)
         (rnrs hashtables)
         (rnrs mutable-pairs)
+        (rnrs records syntactic)
         (only (chezscheme) format command-line-arguments flush-output-port))
 
 ;;; Global symbols and data stack (deque)
 (define joy-env (make-eq-hashtable))
 (define joy-stack (cons '() '())) ;; (top . bot)
 (define joy-mode 'stack)
+(define joy-trail '())
 
-;;; Result pattern for portable error handling
-(define (joy-ok val) (cons 'ok val))
-(define (joy-err msg) (cons 'err msg))
-(define (joy-ok? res) (and (pair? res) (eq? (car res) 'ok)))
-(define (joy-err? res) (and (pair? res) (eq? (car res) 'err)))
-(define (joy-res-val res) (cdr res))
+;;; Internal Result Pattern (Scheme-side only)
+(define-record-type (joy-result make-joy-result joy-result?)
+  (fields (immutable type joy-result-type)
+          (immutable value joy-result-value)))
+
+(define (joy-ok val) (make-joy-result 'ok val))
+(define (joy-fail) (make-joy-result 'fail #f))
+(define (joy-err msg) (make-joy-result 'err msg))
+
+(define (joy-ok? res) (and (joy-result? res) (eq? (joy-result-type res) 'ok)))
+(define (joy-fail? res) (and (joy-result? res) (eq? (joy-result-type res) 'fail)))
+(define (joy-err? res) (and (joy-result? res) (eq? (joy-result-type res) 'err)))
+(define (joy-res-val res) (joy-result-value res))
+
+(define (joy-wrap x)
+  (if (joy-result? x) x (joy-ok x)))
 
 ;;; Environment and Stack Operations
 (define (joy-get sym)
-  (hashtable-ref joy-env sym '()))
+  (hashtable-ref joy-env (string->symbol (string-downcase (symbol->string sym))) '()))
 
 (define (joy-set! sym val)
-  (hashtable-set! joy-env sym val))
+  (hashtable-set! joy-env (string->symbol (string-downcase (symbol->string sym))) val))
 
 ;;; Macro Definitions
+(define-syntax joy-seq
+  (syntax-rules ()
+    ((_ expr) expr)
+    ((_ expr next ...)
+     (let ((res expr))
+       (if (joy-ok? res)
+           (joy-seq next ...)
+           res)))))
+
+(define-syntax joy-bind
+  (syntax-rules ()
+    ((_ (var expr) body ...)
+     (let ((res expr))
+       (if (joy-ok? res)
+           (let ((var (joy-res-val res)))
+             body ...)
+           res)))))
+
 (define-syntax joy-define
   (syntax-rules ()
     ((_ name body ...)
@@ -33,19 +63,16 @@
     ((_ () . body)
       (begin . body))
     ((_ (x . rest) . body)
-      (let ((res (joy-pop!)))
-        (if (joy-err? res) res
-            (let ((x (joy-res-val res)))
-              (joy-let rest . body)))))))
+      (joy-bind (x (joy-pop!))
+        (joy-let rest . body)))))
 
 (define-syntax joy-prim
   (syntax-rules ()
     ((_ (name . args) . body)
       (joy-set! 'name
         (lambda ()
-          (let ((res (joy-let args (begin . body))))
-            (cond ((joy-err? res) res)
-                  ((unspecified? res) (joy-ok #t))
+          (joy-bind (res (joy-wrap (joy-let args (begin . body))))
+            (cond ((unspecified? res) (joy-ok #t))
                   (else (begin (joy-push! res) (joy-ok #t))))))))))
 
 (define (unspecified? x) (eq? x (if #f #f)))
@@ -55,17 +82,16 @@
     ((_ (name . args) . body)
       (joy-set! 'name
         (lambda ()
-          (let ((res (joy-let args (begin . body))))
-            (if (joy-err? res) res (joy-ok #t))))))))
+          (joy-seq (joy-wrap (joy-let args (begin . body)))
+                   (joy-ok #t)))))))
 
 (define-syntax joy-prim-list
   (syntax-rules ()
     ((_ (name . args) . body)
       (joy-set! 'name
         (lambda ()
-          (let ((res (joy-let args (begin . body))))
-            (if (joy-err? res) res
-                (begin (joy-push-list! res) (joy-ok #t)))))))))
+          (joy-bind (res (joy-wrap (joy-let args (begin . body))))
+            (begin (joy-push-list! res) (joy-ok #t))))))))
 
 ;;; Stack operations
 (define (joy-push! x)
@@ -118,51 +144,112 @@
      (joy-shift!))
     (else (joy-err "Deque underflow"))))
 
+;;; Logic Variable Core (Mutation-based)
+(define joy-unbound (list 'unbound))
+
+(define (joy-var? x)
+  (and (pair? x) (null? (cdr x))))
+
+(define (joy-free? x)
+  (and (joy-var? x) (eq? (car x) joy-unbound)))
+
+(define (joy-walk u)
+  (if (and (joy-var? u) (not (eq? (car u) joy-unbound)))
+      (joy-walk (car u))
+      u))
+
+(define (joy-bind! u v)
+  (set-car! u v)
+  (set! joy-trail (cons u joy-trail)))
+
+(define (joy-rollback! old-trail)
+  (let loop ()
+    (unless (eq? joy-trail old-trail)
+      (set-car! (car joy-trail) joy-unbound)
+      (set! joy-trail (cdr joy-trail))
+      (loop))))
+
+(define (joy-unify u v)
+  (let ((u (joy-walk u)) (v (joy-walk v)))
+    (cond
+      ((eq? u v) #t)
+      ((joy-free? u) (joy-bind! u v) #t)
+      ((joy-free? v) (joy-bind! v u) #t)
+      ((and (pair? u) (pair? v))
+       (and (joy-unify (car u) (car v))
+            (joy-unify (cdr u) (cdr v))))
+      (else (equal? u v)))))
+
 ;;; Tokenization and Parsing
 (define (joy-parse-token tok)
-  (cond
-    ((string=? tok "[") 'open-bracket)
-    ((string=? tok "]") 'close-bracket)
-    ((string=? tok ".") '.dot)
-    ((and (> (string-length tok) 1) (char=? (string-ref tok 0) #\'))
-     (let ((content (substring tok 1 (string-length tok))))
-       (cond
-         ((string=? content "\\n") #\newline)
-         ((string=? content "\\t") #\tab)
-         ((string=? content "\\r") #\return)
-         ((string=? content "\\b") #\backspace)
-         ((and (> (string-length content) 1)
-               (char=? (string-ref content 0) #\\)
-               (char-numeric? (string-ref content 1)))
-          (let ((code (string->number (substring content 1 (string-length content)) 8)))
-            (if code (integer->char code) (string->symbol (string-downcase tok)))))
-         ((= (string-length content) 1) (string-ref content 0))
-         (else (string->symbol (string-downcase tok))))))
-    ((and (> (string-length tok) 1) (char=? (string-ref tok 0) #\"))
-     (substring tok 1 (- (string-length tok) 1)))
-    ((string->number tok) => values)
-    ((string=? (string-downcase tok) "true") #t)
-    ((string=? (string-downcase tok) "false") #f)
-    (else (string->symbol (string-downcase tok)))))
+  (let ((low (string-downcase tok)))
+    (cond
+      ((string=? tok "[") 'open-bracket)
+      ((string=? tok "]") 'close-bracket)
+      ((string=? tok "{") 'open-brace)
+      ((string=? tok "}") 'close-brace)
+      ((string=? tok ".") '.dot)
+      ((string=? tok ";") 'semicolon)
+      ((and (> (string-length tok) 1) (char=? (string-ref tok 0) #\'))
+       (let ((content (substring tok 1 (string-length tok))))
+         (cond
+           ((string=? content "\\n") #\newline)
+           ((string=? content "\\t") #\tab)
+           ((string=? content "\\r") #\return)
+           ((string=? content "\\b") #\backspace)
+           ((and (> (string-length content) 1)
+                 (char=? (string-ref content 0) #\\)
+                 (char-numeric? (string-ref content 1)))
+            (let ((code (string->number (substring content 1 (string-length content)) 8)))
+              (if code (integer->char code) (string->symbol low))))
+           ((= (string-length content) 1) (string-ref content 0))
+           (else (string->symbol low)))))
+      ((and (> (string-length tok) 1) (char=? (string-ref tok 0) #\"))
+       (substring tok 1 (- (string-length tok) 1)))
+      (else
+       (let ((n (string->number tok)))
+         (if n n
+             (cond
+               ((string=? low "true") #t)
+               ((string=? low "false") #f)
+               (else (string->symbol low)))))))))
 
 (define (joy-parse-tokens tokens)
   (let loop ((tokens tokens) (result '()) (quote-stack '()))
     (cond
       ((null? tokens)
         (if (null? quote-stack) (reverse result)
-          (joy-error "Unmatched opening bracket")))
+          (joy-err "Unmatched opening bracket")))
       ((eq? (car tokens) 'open-bracket)
-        (loop (cdr tokens) result (cons '() quote-stack)))
-      ((eq? (car tokens) 'close-bracket)
-        (if (null? quote-stack) (joy-error "Unmatched closing bracket")
-          (let ((q (car quote-stack)) (qs (cdr quote-stack)))
-            (if (null? qs)
-              (loop (cdr tokens) (cons (reverse q) result) '())
-              (loop (cdr tokens) result (cons (cons (reverse q) (car qs)) (cdr qs)))))))
+        (loop (cdr tokens) result (cons (cons 'list '()) quote-stack)))
+      ((eq? (car tokens) 'open-brace)
+        (loop (cdr tokens) result (cons (cons 'set '()) quote-stack)))
+      ((or (eq? (car tokens) 'close-bracket) (eq? (car tokens) 'close-brace))
+        (if (null? quote-stack) (joy-err "Unmatched closing bracket/brace")
+          (let* ((top-info (car quote-stack))
+                 (type (car top-info))
+                 (q (cdr top-info))
+                 (qs (cdr quote-stack)))
+            (let ((val (if (eq? type 'list) (reverse q) (joy-tokens->set q))))
+              (if (null? qs)
+                (loop (cdr tokens) (cons val result) '())
+                (loop (cdr tokens) result (cons (cons (caar qs) (cons val (cdar qs))) (cdr qs))))))))
       (else
         (if (null? quote-stack)
           (loop (cdr tokens) (cons (car tokens) result) quote-stack)
-          (loop (cdr tokens) result (cons (cons (car tokens) (car quote-stack)) (cdr quote-stack))))))))
+          (let* ((top-info (car quote-stack))
+                 (type (car top-info))
+                 (q (cdr top-info))
+                 (qs (cdr quote-stack)))
+            (loop (cdr tokens) result (cons (cons type (cons (car tokens) q)) qs))))))))
+
+(define (joy-tokens->set tokens)
+  (let loop ((tokens tokens) (res 0))
+    (if (null? tokens) res
+        (let ((t (car tokens)))
+          (cond ((integer? t) (loop (cdr tokens) (bitwise-ior res (bitwise-arithmetic-shift-left 1 t))))
+                ((char? t) (loop (cdr tokens) (bitwise-ior res (bitwise-arithmetic-shift-left 1 (char->integer t)))))
+                (else (loop (cdr tokens) res)))))))
 
 (define (joy-split chars)
   (let loop ((chars chars) (tokens '()))
@@ -174,7 +261,10 @@
        (loop (drop-comment (cddr chars)) tokens))
       ((char=? (car chars) #\[) (loop (cdr chars) (cons "[" tokens)))
       ((char=? (car chars) #\]) (loop (cdr chars) (cons "]" tokens)))
+      ((char=? (car chars) #\{) (loop (cdr chars) (cons "{" tokens)))
+      ((char=? (car chars) #\}) (loop (cdr chars) (cons "}" tokens)))
       ((char=? (car chars) #\.) (loop (cdr chars) (cons "." tokens)))
+      ((char=? (car chars) #\;) (loop (cdr chars) (cons ";" tokens)))
       ((char=? (car chars) #\") (call-with-values (lambda () (read-string (cdr chars)))
                                   (lambda (str rest) (loop rest (cons str tokens)))))
       ((char=? (car chars) #\') (call-with-values (lambda () (read-char-literal (cdr chars)))
@@ -213,8 +303,14 @@
 (define (read-word chars)
   (let loop ((chars chars) (acc '()))
     (cond ((null? chars) (values (list->string (reverse acc)) '()))
+          ((and (char=? (car chars) #\.)
+                (not (null? acc))
+                (char-numeric? (car acc))
+                (not (null? (cdr chars)))
+                (char-numeric? (cadr chars)))
+           (loop (cdr chars) (cons (car chars) acc)))
           ((or (char-whitespace? (car chars))
-               (member (car chars) '(#\[ #\] #\. #\( #\# #\")))
+               (member (car chars) '(#\[ #\] #\{ #\} #\. #\( #\# #\" #\;)))
            (values (list->string (reverse acc)) chars))
           (else (loop (cdr chars) (cons (car chars) acc))))))
 
@@ -230,7 +326,7 @@
             ((eq? token 'define)
              (let* ((name (cadr code))
                     (rest (cddr code)))
-               (let ((rest-after-eq (if (eq? (car rest) '==) (cdr rest) rest)))
+               (let ((rest-after-eq (if (and (not (null? rest)) (eq? (car rest) '==)) (cdr rest) rest)))
                  (let find-dot ((in rest-after-eq) (body '()))
                    (cond
                      ((null? in) (joy-err "Missing . in DEFINE"))
@@ -240,7 +336,7 @@
                      (else (find-dot (cdr in) (cons (car in) body))))))))
             (else
               (let ((res (joy-exec-one token)))
-                (if (joy-err? res) res (loop (cdr code))))))))))
+                (if (joy-ok? res) (loop (cdr code)) res))))))))
 
 (define (joy-exec-one token)
   (cond
@@ -264,6 +360,10 @@
   (cond ((eq? x #t) (display "true"))
         ((eq? x #f) (display "false"))
         ((char? x) (display "'") (display x))
+        ((joy-var? x)
+         (if (eq? (car x) joy-unbound)
+             (display "[]")
+             (begin (display "[") (joy-write (car x)) (display "]"))))
         (else (write x))))
 
 ;;; Equality and Comparison helpers
@@ -285,7 +385,13 @@
     ((and (number? x) (number? y)) (cond ((< x y) -1) ((> x y) 1) (else 0)))
     ((and (char? x) (char? y)) (cond ((char<? x y) -1) ((char>? x y) 1) (else 0)))
     ((and (string? x) (string? y)) (cond ((string<? x y) -1) ((string>? x y) 1) (else 0)))
+    ((and (number? x) (char? y)) (joy-compare x (char->integer y)))
+    ((and (char? x) (number? y)) (joy-compare (char->integer x) y))
     (else 0)))
+
+;;; Helper to pop raw value
+(define (joy-pop-val) (joy-res-val (joy-pop!)))
+(define (joy-peek-val) (joy-res-val (joy-peek)))
 
 ;;; Primitives
 (joy-prim-void (dot x) (joy-write x) (newline))
@@ -300,14 +406,23 @@
 
 (joy-prim-list (dup x) (list x x))
 (joy-prim-void (pop x) (joy-ok #t))
-(joy-prim-list (swap x y) (list y x))
-(joy-prim-list (rot x y z) (list y z x))
-(joy-prim-list (rollup x y z) (list z x y))
-(joy-prim-list (rolldown x y z) (list y z x))
-(joy-prim-list (over x y) (list x y x))
-(joy-prim-list (pick x y z) (list x y z x))
-(joy-prim-list (tuck x y) (list y x y))
-(joy-prim (nip x y) y)
+(joy-prim-void (id) (joy-ok #t))
+(joy-prim-list (swap top next) (list next top))
+(joy-prim-list (rot top next third) (list next third top))
+
+(joy-prim-list (dup2 top next) (list next top next top))
+(joy-prim-void (pop2 top next) (joy-ok #t))
+(joy-prim-list (swap2 t n3 n2 n1) (list n2 n1 t n3))
+
+(joy-prim-void (rollup top next third)
+  (begin (joy-push! top) (joy-push! third) (joy-push! next) (joy-ok #t)))
+(joy-prim-void (rolldown top next third)
+  (begin (joy-push! next) (joy-push! top) (joy-push! third) (joy-ok #t)))
+
+(joy-prim-list (over top next) (list next top next))
+(joy-prim-list (pick top next third) (list third next top third))
+(joy-prim-list (tuck top next) (list top next top))
+(joy-prim (nip top next) top)
 
 (joy-prim-void (dip quot)
   (if (list? quot)
@@ -319,51 +434,59 @@
                 exec-res))))
       (joy-err "dip expects a quotation")))
 
-(joy-prim-void (dip2 quot)
+(joy-prim-void (dip2 quot top next)
   (if (list? quot)
-      (let ((res-x (joy-pop!)))
-        (if (joy-err? res-x) res-x
-            (let ((res-y (joy-pop!)))
-              (if (joy-err? res-y) res-y
-                  (let ((exec-res (joy-exec quot)))
-                    (joy-push! (joy-res-val res-y))
-                    (joy-push! (joy-res-val res-x))
-                    exec-res)))))
+      (let ((exec-res (joy-exec quot)))
+        (joy-push! next)
+        (joy-push! top)
+        exec-res)
       (joy-err "dip2 expects a quotation")))
 
-(joy-prim (+ x y)
-  (cond ((and (number? x) (number? y)) (+ x y))
-        ((and (char? x) (integer? y)) (integer->char (+ (char->integer x) y)))
-        ((and (integer? x) (char? y)) (integer->char (+ x (char->integer y))))
-        (else (joy-err "type error: + expects numbers or char+int"))))
+(joy-prim (+ top next)
+  (let ((x next) (y top))
+    (cond ((and (number? x) (number? y)) (+ x y))
+          ((and (char? x) (integer? y)) (integer->char (+ (char->integer x) y)))
+          ((and (integer? x) (char? y)) (integer->char (+ x (char->integer y))))
+          (else (joy-err "type error: + expects numbers or char+int")))))
 
-(joy-prim (- x y)
-  (cond ((and (number? x) (number? y)) (- x y))
-        ((and (char? x) (integer? y)) (integer->char (- (char->integer x) y)))
-        ((and (char? x) (char? y)) (- (char->integer x) (char->integer y)))
-        (else (joy-err "type error: - expects numbers or char+int/char"))))
-(joy-prim (* x y) (* x y))
-(joy-prim (/ x y) (if (zero? y) (joy-err "Division by zero") (/ x y)))
-(joy-prim (div x y) (if (zero? y) (joy-err "Division by zero") (quotient x y)))
-(joy-prim (mod x y) (if (zero? y) (joy-err "Division by zero") (remainder x y)))
-(joy-prim (rem x y) (if (zero? y) (joy-err "Division by zero") (remainder x y)))
-(joy-prim (abs x) (abs x))
-(joy-prim (neg x) (- x))
-(joy-prim (sqrt x) (sqrt x))
-(joy-prim (pow x y) (expt x y))
-(joy-prim (succ x) (if (char? x) (integer->char (+ (char->integer x) 1)) (+ x 1)))
-(joy-prim (pred x) (if (char? x) (integer->char (- (char->integer x) 1)) (- x 1)))
+(joy-prim (- top next)
+  (let ((x next) (y top))
+    (cond ((and (number? x) (number? y)) (- x y))
+          ((and (char? x) (integer? y)) (integer->char (- (char->integer x) y)))
+          ((and (char? x) (char? y)) (- (char->integer x) (char->integer y)))
+          (else (joy-err "type error: - expects numbers or char+int/char")))))
 
-(joy-prim (= x y) (joy-equal? x y))
-(joy-prim (equal x y) (joy-equal? x y))
-(joy-prim (eql x y) (joy-equal? x y))
-(joy-prim (< x y) (< (joy-compare x y) 0))
-(joy-prim (> x y) (> (joy-compare x y) 0))
-(joy-prim (<= x y) (<= (joy-compare x y) 0))
-(joy-prim (>= x y) (>= (joy-compare x y) 0))
-(joy-prim (not= x y) (not (joy-equal? x y)))
-(joy-prim (neql x y) (not (joy-equal? x y)))
-(joy-prim (compare x y) (joy-compare x y))
+(joy-prim (* top next) (* next top))
+(joy-prim (/ top next) (if (zero? top) (joy-err "Division by zero") (/ next top)))
+(joy-prim (div top next) (if (zero? top) (joy-err "Division by zero") (quotient next top)))
+(joy-prim (mod top next) (if (zero? top) (joy-err "Division by zero") (remainder next top)))
+(joy-prim (rem top next) (if (zero? top) (joy-err "Division by zero") (remainder next top)))
+
+(joy-prim (abs x) (if (number? x) (abs x) (joy-err "abs expects number")))
+(joy-prim (neg x) (if (number? x) (- x) (joy-err "neg expects number")))
+(joy-prim (sign x) (if (number? x) (cond ((> x 0) 1) ((< x 0) -1) (else 0)) (joy-err "sign expects number")))
+(joy-prim (max top next) (if (and (number? top) (number? next)) (if (>= next top) next top) (joy-err "max expects numbers")))
+(joy-prim (min top next) (if (and (number? top) (number? next)) (if (<= next top) next top) (joy-err "min expects numbers")))
+(joy-prim (sqrt x) (if (number? x) (sqrt x) (joy-err "sqrt expects number")))
+(joy-prim (pow top next) (expt next top))
+
+(joy-prim (succ x) (cond ((char? x) (integer->char (+ (char->integer x) 1)))
+                         ((number? x) (+ x 1))
+                         (else (joy-err "succ expects char or number"))))
+(joy-prim (pred x) (cond ((char? x) (integer->char (- (char->integer x) 1)))
+                         ((number? x) (- x 1))
+                         (else (joy-err "pred expects char or number"))))
+
+(joy-prim (= top next) (joy-equal? next top))
+(joy-prim (equal top next) (joy-equal? next top))
+(joy-prim (eql top next) (joy-equal? next top))
+(joy-prim (< top next) (< (joy-compare next top) 0))
+(joy-prim (> top next) (> (joy-compare next top) 0))
+(joy-prim (<= top next) (<= (joy-compare next top) 0))
+(joy-prim (>= top next) (>= (joy-compare next top) 0))
+(joy-prim (not= top next) (not (joy-equal? next top)))
+(joy-prim (neql top next) (not (joy-equal? next top)))
+(joy-prim (compare top next) (joy-compare next top))
 
 (joy-prim (zero? x) (if (number? x) (= x 0) #f))
 (joy-prim (pos? x) (if (number? x) (> x 0) #f))
@@ -372,37 +495,79 @@
 (joy-prim (even? x) (if (integer? x) (even? x) #f))
 (joy-prim (small? x) (and (integer? x) (< x 100)))
 
-(joy-prim (and x y) (and x y))
-(joy-prim (or x y) (or x y))
-(joy-prim (not x) (not x))
+(joy-prim (and top next)
+  (let ((x next) (y top))
+    (cond ((and (boolean? x) (boolean? y)) (and x y))
+          ((and (integer? x) (integer? y)) (bitwise-and x y))
+          (else (joy-err "and expects booleans or integers")))))
+(joy-prim (or top next)
+  (let ((x next) (y top))
+    (cond ((and (boolean? x) (boolean? y)) (or x y))
+          ((and (integer? x) (integer? y)) (bitwise-ior x y))
+          (else (joy-err "or expects booleans or integers")))))
+(joy-prim (xor top next)
+  (let ((x next) (y top))
+    (cond ((and (boolean? x) (boolean? y)) (not (eq? x y)))
+          ((and (integer? x) (integer? y)) (bitwise-xor x y))
+          (else (joy-err "xor expects booleans or integers")))))
+(joy-prim (not x) (cond ((boolean? x) (not x))
+                        ((integer? x) (bitwise-not x))
+                        (else (joy-err "not expects boolean or integer"))))
 
-(joy-prim (integer? x) (integer? x))
-(joy-prim (boolean? x) (boolean? x))
-(joy-prim (list? x) (list? x))
-(joy-prim (symbol? x) (symbol? x))
-(joy-prim (char? x) (char? x))
-(joy-prim (string? x) (string? x))
-(joy-prim (null? x) (null? x))
+(joy-prim (integer x) (integer? x))
+(joy-prim (boolean x) (boolean? x))
+(joy-prim (list x) (list? x))
+(joy-prim (symbol x) (symbol? x))
+(joy-prim (char x) (char? x))
+(joy-prim (string x) (string? x))
+(joy-prim (null x) (null? x))
 
-(joy-prim (char x)
-  (cond ((integer? x) (integer->char x))
-        ((char? x) (char->integer x))
-        (else (joy-err "char expects integer or character"))))
+(joy-prim (ord x) (if (char? x) (char->integer x) (joy-err "ord expects char")))
+(joy-prim (chr x) (if (integer? x) (integer->char x) (joy-err "chr expects int")))
 
-(joy-prim (cons x y) (if (list? y) (cons x y) (joy-err "cons expects a list")))
-(joy-prim (swons x y) (if (list? x) (cons y x) (joy-err "swons expects a list")))
-(joy-prim-list (uncons x) (if (pair? x) (list (car x) (cdr x)) (joy-err "uncons expects a non-empty list")))
-(joy-prim (first x) (if (pair? x) (car x) (joy-err "first expects a non-empty list")))
-(joy-prim (rest x) (if (pair? x) (cdr x) (joy-err "rest expects a non-empty list")))
-(joy-prim (length x) (length x))
-(joy-prim (append x y) (append x y))
-(joy-prim (reverse x) (reverse x))
-(joy-prim (second x) (car (cdr x)))
-(joy-prim (third x) (car (cdr (cdr x))))
+(joy-prim (cons top next) (if (list? top) (cons next top) (joy-err "cons expects a list")))
+(joy-prim (swons top next) (if (list? next) (cons top next) (joy-err "swons expects a list")))
+(joy-prim (snoc top next)
+  (cond ((list? next) (append next (list top)))
+        ((and (string? next) (char? top)) (string-append next (string top)))
+        (else (joy-err "snoc expects list or string+char"))))
 
-(joy-prim (take n lst) (if (and (integer? n) (list? lst)) (take n lst) (joy-err "take expects int and list")))
-(joy-prim (drop n lst) (if (and (integer? n) (list? lst)) (drop n lst) (joy-err "drop expects int and list")))
-(joy-prim (at n lst) (if (and (integer? n) (list? lst)) (list-ref lst n) (joy-err "at expects int and list")))
+(joy-prim-list (uncons x)
+  (cond ((pair? x) (list (car x) (cdr x)))
+        ((string? x) (if (> (string-length x) 0)
+                         (list (string-ref x 0) (substring x 1 (string-length x)))
+                         (joy-err "uncons expects non-empty string")))
+        (else (joy-err "uncons expects list or string"))))
+
+(joy-prim-list (uncons-bot x)
+  (cond ((and (list? x) (not (null? x)))
+         (let ((r (reverse x)))
+           (list (reverse (cdr r)) (car r))))
+        ((and (string? x) (> (string-length x) 0))
+         (let ((n (string-length x)))
+           (list (substring x 0 (- n 1)) (string-ref x (- n 1)))))
+        (else (joy-err "uncons-bot expects a non-empty list or string"))))
+(joy-prim (first x)
+  (cond ((pair? x) (car x))
+        ((string? x) (if (> (string-length x) 0) (string-ref x 0) (joy-err "first expects non-empty string")))
+        (else (joy-err "first expects list or string"))))
+(joy-prim (rest x)
+  (cond ((pair? x) (cdr x))
+        ((string? x) (if (> (string-length x) 0) (substring x 1 (string-length x)) (joy-err "rest expects non-empty string")))
+        (else (joy-err "rest expects list or string"))))
+(joy-prim (length x) (cond ((list? x) (length x)) ((string? x) (string-length x)) (else 0)))
+(joy-prim (append top next)
+  (let ((x next) (y top))
+    (cond ((and (list? x) (list? y)) (append x y))
+          ((and (string? x) (string? y)) (string-append x y))
+          (else (joy-err "append expects two lists or two strings")))))
+(joy-prim (reverse x) (cond ((list? x) (reverse x))
+                            ((string? x) (list->string (reverse (string->list x))))
+                            (else x)))
+
+(joy-prim (take top next) (if (and (integer? top) (list? next)) (take top next) (joy-err "take expects int and list")))
+(joy-prim (drop top next) (if (and (integer? top) (list? next)) (drop top next) (joy-err "drop expects int and list")))
+(joy-prim (at top next) (if (and (integer? top) (list? next)) (list-ref next top) (joy-err "at expects int and list")))
 
 (joy-prim-void (print x) (joy-write x) (newline))
 (joy-prim-void (put x) (joy-write x) (display " "))
@@ -410,174 +575,188 @@
 ;;; Combinators
 (joy-prim-void (i quot) (if (list? quot) (joy-exec quot) (joy-err "i expects a quotation")))
 
-(joy-prim-void (ifte test then-branch else-branch)
-  (if (and (list? then-branch) (list? else-branch))
-    (begin (joy-push! test)
-      (let ((res (joy-exec '(i))))
-        (if (joy-err? res) res
-          (let ((cond-res (joy-pop!)))
-            (if (joy-err? cond-res) cond-res
-              (if (joy-res-val cond-res) (joy-exec then-branch) (joy-exec else-branch)))))))
-    (joy-err "ifte expects two quotations")))
+(joy-prim-void (ifte e t p)
+  (begin (joy-push! p)
+    (joy-seq (joy-exec '(i))
+      (joy-bind (cond-res (joy-pop!))
+        (if cond-res (joy-exec t) (joy-exec e))))))
 
-(define (joy-pop-val) (joy-res-val (joy-pop!)))
-(define (joy-peek-val) (joy-res-val (joy-peek)))
+(joy-prim-void (map quot lst)
+  (let loop ((in lst) (out '()))
+    (if (null? in) (begin (joy-push! (reverse out)) (joy-ok #t))
+        (begin (joy-push! (car in))
+          (joy-seq (joy-exec quot)
+            (joy-bind (item (joy-pop!))
+              (loop (cdr in) (cons item out))))))))
 
-(joy-prim-void (map quot)
-  (if (and (list? quot) (list? (joy-peek-val)))
-      (let ((lst (joy-pop-val)))
-        (let loop ((in lst) (out '()))
-          (if (null? in) (begin (joy-push! (reverse out)) (joy-ok #t))
-              (begin (joy-push! (car in))
-                (let ((res (joy-exec quot)))
-                  (if (joy-err? res) res
-                      (let ((item (joy-pop!)))
-                        (if (joy-err? item) item (loop (cdr in) (cons (joy-res-val item) out))))))))))
-      (joy-err "map expects a quotation and a list")))
+(joy-prim-void (filter quot lst)
+  (let loop ((in lst) (out '()))
+    (if (null? in) (begin (joy-push! (reverse out)) (joy-ok #t))
+        (begin (joy-push! (car in))
+          (joy-seq (joy-exec quot)
+            (joy-bind (item (joy-pop!))
+              (loop (cdr in) (if item (cons (car in) out) out))))))))
 
-(joy-prim-void (filter quot)
-  (if (and (list? quot) (list? (joy-peek-val)))
-      (let ((lst (joy-pop-val)))
-        (let loop ((in lst) (out '()))
-          (if (null? in) (begin (joy-push! (reverse out)) (joy-ok #t))
-              (begin (joy-push! (car in))
-                (let ((res (joy-exec quot)))
-                  (if (joy-err? res) res
-                      (let ((item (joy-pop!)))
-                        (if (joy-err? item) item
-                            (loop (cdr in) (if (joy-res-val item) (cons (car in) out) out))))))))))
-      (joy-err "filter expects a quotation and a list")))
+(joy-prim-void (fold quot init lst)
+  (begin (joy-push! init)
+    (let loop ((in lst))
+      (if (null? in) (joy-ok #t)
+          (begin (joy-push! (car in))
+            (joy-seq (joy-exec quot) (loop (cdr in))))))))
 
-(joy-prim-void (fold quot)
-  (if (and (list? quot) (list? (joy-peek-val)))
-      (let ((lst (joy-pop-val)) (init (joy-pop-val)))
-        (joy-push! init)
-        (let loop ((in lst))
-          (if (null? in) (joy-ok #t)
-              (begin (joy-push! (car in))
-                (let ((res (joy-exec quot)))
-                  (if (joy-err? res) res (loop (cdr in))))))))
-      (joy-err "fold expects a quotation, an initial value and a list")))
+(joy-prim-void (times quot n)
+  (let loop ((count n))
+    (if (<= count 0) (joy-ok #t)
+        (joy-seq (joy-exec quot) (loop (- count 1))))))
 
-(joy-prim-void (times quot)
-  (if (and (list? quot) (integer? (joy-peek-val)))
-      (let ((n (joy-pop-val)))
-        (let loop ((count n))
-          (if (<= count 0) (joy-ok #t)
-              (let ((res (joy-exec quot)))
-                (if (joy-err? res) res (loop (- count 1)))))))
-      (joy-err "times expects a quotation and an integer")))
+(joy-prim-void (while body test)
+  (let loop ()
+    (joy-seq (joy-exec test)
+      (joy-bind (cond-res (joy-pop!))
+        (if cond-res
+            (joy-seq (joy-exec body) (loop))
+            (joy-ok #t))))))
 
-(joy-prim-void (while test-quot body-quot)
-  (if (and (list? test-quot) (list? body-quot))
-      (let loop ()
-        (let ((res (joy-exec test-quot)))
-          (if (joy-err? res) res
-              (let ((cond-res (joy-pop!)))
-                (if (joy-err? cond-res) cond-res
-                    (if (joy-res-val cond-res)
-                        (let ((body-res (joy-exec body-quot)))
-                          (if (joy-err? body-res) body-res (loop)))
-                        (joy-ok #t)))))))
-      (joy-err "while expects two quotations")))
+(joy-prim-void (step quot obj)
+  (let loop ((in (if (string? obj) (string->list obj) obj)))
+    (if (null? in) (joy-ok #t)
+        (begin (joy-push! (car in))
+          (joy-seq (joy-exec quot) (loop (cdr in)))))))
 
-(joy-prim-void (step quot)
-  (if (and (list? quot) (list? (joy-peek-val)))
-      (let ((lst (joy-pop-val)))
-        (let loop ((in lst))
-          (if (null? in) (joy-ok #t)
-              (begin (joy-push! (car in))
-                (let ((res (joy-exec quot)))
-                  (if (joy-err? res) res (loop (cdr in))))))))
-      (joy-err "step expects a quotation and a list")))
-
-(joy-prim-void (branch condition then-branch else-branch)
-  (if (and (list? then-branch) (list? else-branch))
-    (if condition (joy-exec then-branch) (joy-exec else-branch))
-    (joy-err "branch expects two quotations")))
+(joy-prim-void (branch else then condition)
+  (if condition (joy-exec then) (joy-exec else)))
 
 (joy-prim-void (nullary quot)
-  (if (list? quot)
-    (let ((saved-f (car joy-stack)) (saved-b (cdr joy-stack)))
-      (let ((res (joy-exec quot)))
-        (if (joy-err? res) res
-          (let ((pop-res (joy-pop!)))
-            (set-car! joy-stack saved-f)
-            (set-cdr! joy-stack saved-b)
-            (if (joy-err? pop-res) pop-res
-              (begin (joy-push! (joy-res-val pop-res)) (joy-ok #t)))))))
-    (joy-err "nullary expects a quotation")))
+  (let ((saved-f (car joy-stack)) (saved-b (cdr joy-stack)))
+    (joy-seq (joy-exec quot)
+      (joy-bind (pop-res (joy-pop!))
+        (set-car! joy-stack saved-f) (set-cdr! joy-stack saved-b)
+        (begin (joy-push! pop-res) (joy-ok #t))))))
 
 (joy-prim-void (unary quot x)
-  (if (list? quot)
-    (let ((saved-f (car joy-stack)) (saved-b (cdr joy-stack)))
-      (joy-clear-stack!) (joy-push! x)
-      (let ((res (joy-exec quot)))
-        (if (joy-err? res) res
-          (let ((pop-res (joy-pop!)))
-            (set-car! joy-stack saved-f) (set-cdr! joy-stack saved-b)
-            (if (joy-err? pop-res) pop-res
-              (begin (joy-push! x) (joy-push! (joy-res-val pop-res)) (joy-ok #t)))))))
-    (joy-err "unary expects a quotation")))
+  (let ((saved-f (car joy-stack)) (saved-b (cdr joy-stack)))
+    (joy-clear-stack!) (joy-push! x)
+    (joy-seq (joy-exec quot)
+      (joy-bind (pop-res (joy-pop!))
+        (set-car! joy-stack saved-f) (set-cdr! joy-stack saved-b)
+        (begin (joy-push! x) (joy-push! pop-res) (joy-ok #t))))))
 
 (joy-prim-void (binary quot x y)
-  (if (list? quot)
-    (let ((saved-f (car joy-stack)) (saved-b (cdr joy-stack)))
-      (joy-clear-stack!) (joy-push! y) (joy-push! x)
-      (let ((res (joy-exec quot)))
-        (if (joy-err? res) res
-          (let ((pop-res (joy-pop!)))
-            (set-car! joy-stack saved-f) (set-cdr! joy-stack saved-b)
-            (if (joy-err? pop-res) pop-res
-              (begin (joy-push! y) (joy-push! x) (joy-push! (joy-res-val pop-res)) (joy-ok #t)))))))
-    (joy-err "binary expects a quotation")))
+  (let ((saved-f (car joy-stack)) (saved-b (cdr joy-stack)))
+    (joy-clear-stack!) (joy-push! y) (joy-push! x)
+    (joy-seq (joy-exec quot)
+      (joy-bind (pop-res (joy-pop!))
+        (set-car! joy-stack saved-f) (set-cdr! joy-stack saved-b)
+        (begin (joy-push! y) (joy-push! x) (joy-push! pop-res) (joy-ok #t))))))
 
-(joy-prim-void (linrec p t r1 r2)
-  (if (and (list? p) (list? t) (list? r1) (list? r2))
-    (let rec ()
-      (joy-push! p)
-      (let ((res (joy-exec '(i))))
-        (if (joy-err? res) res
-          (let ((cond-res (joy-pop!)))
-            (if (joy-err? cond-res) cond-res
-              (if (joy-res-val cond-res) (begin (joy-push! t) (joy-exec '(i)))
-                (begin (joy-push! r1)
-                       (let ((r1-res (joy-exec '(i))))
-                         (if (joy-err? r1-res) r1-res
-                           (let ((inner (rec)))
-                             (if (joy-err? inner) inner
-                               (begin (joy-push! r2) (joy-exec '(i))))))))))))))
-    (joy-err "linrec expects four quotations")))
+(joy-prim-void (linrec r2 r1 t p)
+  (let rec ()
+    (joy-push! p) (joy-seq (joy-exec '(i))
+      (joy-bind (cond-res (joy-pop!))
+        (if cond-res (joy-seq (joy-exec t))
+          (joy-seq (joy-exec r1) (rec) (joy-exec r2)))))))
 
-(joy-prim-void (binrec p t r1 r2)
-  (if (and (list? p) (list? t) (list? r1) (list? r2))
-    (let rec ()
-      (joy-push! p)
-      (let ((res (joy-exec '(i))))
-        (if (joy-err? res) res
-          (let ((cond-res (joy-pop!)))
-            (if (joy-err? cond-res) cond-res
-              (if (joy-res-val cond-res) (begin (joy-push! t) (joy-exec '(i)))
-                (begin (joy-push! r1)
-                       (let ((r1-res (joy-exec '(i))))
-                         (if (joy-err? r1-res) r1-res
-                           (let ((inner1 (rec)))
-                             (if (joy-err? inner1) inner1
-                               (let ((inner2 (rec)))
-                                 (if (joy-err? inner2) inner2
-                                   (begin (joy-push! r2) (joy-exec '(i))))))))))))))))
-    (joy-err "binrec expects four quotations")))
+(joy-prim-void (binrec r2 r1 t p)
+  (let rec ()
+    (joy-push! p) (joy-seq (joy-exec '(i))
+      (joy-bind (cond-res (joy-pop!))
+        (if cond-res (joy-seq (joy-exec t))
+          (joy-seq (joy-exec r1) (rec) (rec) (joy-exec r2)))))))
 
 (joy-prim-void (infra quot lst)
-  (if (and (list? quot) (list? lst))
-    (let ((saved-f (car joy-stack)) (saved-b (cdr joy-stack)))
-      (joy-clear-stack!) (joy-push-list! lst)
-      (let ((res (joy-exec quot)))
-        (if (joy-err? res) (begin (set-car! joy-stack saved-f) (set-cdr! joy-stack saved-b) res)
-            (let ((new-lst (append (car joy-stack) (reverse (cdr joy-stack)))))
-              (set-car! joy-stack saved-f) (set-cdr! joy-stack saved-b)
-              (joy-push! (reverse new-lst)) (joy-ok #t)))))
-    (joy-err "infra expects a quotation and a list")))
+  (let ((saved-f (car joy-stack)) (saved-b (cdr joy-stack)))
+    (joy-clear-stack!) (joy-push-list! lst)
+    (joy-seq (joy-exec quot)
+      (let ((new-lst (append (car joy-stack) (reverse (cdr joy-stack)))))
+        (set-car! joy-stack saved-f) (set-cdr! joy-stack saved-b)
+        (begin (joy-push! (reverse new-lst)) (joy-ok #t))))))
+
+(joy-prim-void (cleave q2 q1 x)
+  (begin (joy-push! x)
+    (joy-seq (joy-exec q1)
+      (joy-bind (y1 (joy-pop!))
+        (joy-push! x)
+        (joy-seq (joy-exec q2)
+          (begin (joy-push! y1) (joy-exec '(swap)) (joy-ok #t)))))))
+
+(joy-prim-void (cond-word cases)
+  (let loop ((c cases))
+    (cond
+      ((null? c) (joy-ok #t))
+      ((null? (cdr c)) (joy-exec (car c)))
+      (else
+       (joy-push! (car c))
+       (joy-seq (joy-exec '(i))
+         (joy-bind (pred (joy-pop!))
+           (if pred
+               (joy-exec (cadr c))
+               (loop (cddr c)))))))))
+
+(joy-prim-void (primrec step init x)
+  (cond
+    ((integer? x)
+     (let loop ((n x))
+       (if (<= n 0) (joy-exec init)
+           (begin (joy-push! n)
+                  (joy-seq (loop (- n 1)) (joy-exec step))))))
+    ((list? x)
+     (let loop ((l x))
+       (if (null? l) (joy-exec init)
+           (begin (joy-push! (car l))
+                  (joy-seq (loop (cdr l)) (joy-exec step))))))
+    ((string? x)
+     (let loop ((s (string->list x)))
+       (if (null? s) (joy-exec init)
+           (begin (joy-push! (car s))
+                  (joy-seq (loop (cdr s)) (joy-exec step))))))
+    (else (joy-err "primrec expects integer, list or string"))))
+
+(joy-prim-void (genrec r2 r1 t p)
+  (let rec ()
+    (joy-push! p) (joy-seq (joy-exec '(i))
+      (joy-bind (cond-res (joy-pop!))
+        (if cond-res (joy-exec t)
+            (joy-seq (joy-exec r1) (rec) (joy-exec r2)))))))
+
+(joy-prim-void (treerec comb leaf)
+  (let rec ()
+    (joy-bind (item (joy-pop!))
+      (if (list? item)
+          (let loop ((in item) (out '()))
+            (if (null? in)
+                (begin (joy-push! (reverse out)) (joy-exec comb))
+                (begin (joy-push! (car in))
+                       (joy-seq (rec)
+                                (joy-bind (res (joy-pop!))
+                                  (loop (cdr in) (cons res out)))))))
+          (begin (joy-push! item) (joy-exec leaf))))))
+
+;;; Logic Primitives
+(joy-prim-void (hole) (joy-push! (list joy-unbound)) (joy-ok #t))
+(joy-prim-void (unify)
+  (joy-bind (u (joy-pop!))
+    (joy-bind (v (joy-pop!))
+      (begin
+        (if (joy-unify u v) (joy-push! #t) (joy-push! #f))
+        (joy-ok #t)))))
+
+(joy-prim-void (unify-ends)
+  (joy-bind (u (joy-pop!))
+    (joy-bind (v (joy-shift!))
+      (begin
+        (if (joy-unify u v) (joy-push! #t) (joy-push! #f))
+        (joy-ok #t)))))
+
+(joy-prim-void (lifte else-branch then-branch test-quot)
+  (let ((old-trail joy-trail))
+    (joy-push! test-quot)
+    (joy-seq (joy-exec '(i))
+      (joy-bind (cond-res (joy-pop!))
+        (if cond-res
+            (joy-exec then-branch)
+            (begin
+              (joy-rollback! old-trail)
+              (joy-exec else-branch)))))))
 
 ;;; Deque mode primitives
 (joy-prim-void (pull) (let ((res (joy-shift!)))
@@ -587,7 +766,11 @@
 (joy-prim-void (set-mode m) (set! joy-mode m) (joy-ok #t))
 
 ;;; Aliases and Dip versions
-(joy-set! 'null (joy-get 'null?))
+(joy-set! 'null (hashtable-ref joy-env 'null? #f))
+(joy-set! 'small (hashtable-ref joy-env 'small? #f))
+(joy-set! 'concat (hashtable-ref joy-env 'append #f))
+(joy-set! 'div (hashtable-ref joy-env '/ #f))
+(joy-set! 'rem (hashtable-ref joy-env 'mod #f))
 (joy-define dupd [dup] dip)
 (joy-define swapd [swap] dip)
 (joy-define rolldownd [rolldown] dip)
@@ -608,1931 +791,58 @@
 (joy-define bind-ok [is-ok?] [unwrap swap i] [] ifte)
 
 ;;; REPL and Entry
+(define (balanced? str)
+  (let loop ((chars (string->list str)) (count 0) (in-string #f))
+    (cond
+      ((null? chars) (<= count 0))
+      (else
+       (let ((c (car chars)))
+         (cond
+           (in-string
+            (if (char=? c #\") (loop (cdr chars) count #f) (loop (cdr chars) count #t)))
+           ((char=? c #\") (loop (cdr chars) count #t))
+           ((char=? c #\[) (loop (cdr chars) (+ count 1) #f))
+           ((char=? c #\]) (loop (cdr chars) (- count 1) #f))
+           (else (loop (cdr chars) count #f))))))))
+
 (define (joy-repl)
-  (display "> ") (flush-output-port (current-output-port))
-  (let ((line (get-line (current-input-port))))
-    (cond ((eof-object? line) (display "Goodbye.\n"))
-          (else (let ((res (joy-exec (joy-tokenize line))))
-                  (if (joy-err? res) (begin (display "ERROR: ") (display (joy-res-val res)) (newline))
-                      (joy-print-stack)))
-                (joy-repl)))))
+  (let loop ((buffer ""))
+    (display (if (string=? buffer "") "> " ">> ")) (flush-output-port (current-output-port))
+    (let ((line (get-line (current-input-port))))
+      (cond ((eof-object? line) (display "\nGoodbye.\n"))
+            (else
+             (let ((combined (string-append buffer " " line)))
+               (if (and (balanced? combined)
+                        (or (not (string-contains combined "define"))
+                            (string-contains combined ".")))
+                   (begin
+                     (guard (ex (else (display "SCHEME EXCEPTION: ") (display (condition-message ex)) (newline)))
+                       (let ((res (joy-exec (joy-tokenize combined))))
+                         (if (joy-err? res) (begin (display "ERROR: ") (display (joy-res-val res)) (newline))
+                             (joy-print-stack))))
+                     (joy-repl))
+                   (loop combined))))))))
 
-(define (joy-read-all)
-  (let loop ((chars '()))
-    (let ((c (read-char (current-input-port))))
-      (if (eof-object? c) (joy-tokenize (list->string (reverse chars)))
-          (loop (cons c chars))))))
+(define (string-contains s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0))
+      (cond ((> (+ i m) n) #f)
+            ((string=? (substring s i (+ i m)) sub) #t)
+            (else (loop (+ i 1)))))))
 
+;;; Entry Point
 (let ((args (command-line-arguments)))
   (cond ((null? args) (display "Joy. Type 'help' for commands.\n") (joy-repl))
-        (else (let ((res (joy-exec (joy-read-all))))
-                (if (joy-err? res)
-                    (begin (display "ERROR: ") (display (joy-res-val res)) (newline))
-                    (joy-print-stack))))))
-      (joy-set! 'name '(body ...)))))
-
-;;; Pattern-match and bind Joy stack arguments to variables
-(define-syntax joy-let
-  (syntax-rules ()
-    ((_ () . body)
-      (begin . body))
-    ((_ (x . rest) . body)
-      (let ((res (joy-pop!)))
-        (if (joy-err? res)
-            res
-            (let ((x (joy-res-val res)))
-              (joy-let rest . body)))))))
-
-;;; Define a Joy word that returns a single result
-(define-syntax joy-prim
-  (syntax-rules ()
-    ((_ (name . args) . body)
-      (joy-set! 'name
-        (lambda ()
-          (let ((res (joy-let args (begin . body))))
-            (if (joy-err? res)
-                res
-                (begin (joy-push! res) (joy-ok #t)))))))))
-
-;;; Define a Joy word that performs side effects without returning a value
-(define-syntax joy-prim-void
-  (syntax-rules ()
-    ((_ (name . args) . body)
-      (joy-set! 'name
-        (lambda ()
-          (let ((res (joy-let args (begin . body))))
-            (if (joy-err? res) res (joy-ok #t))))))))
-
-;;; Define a Joy word that returns multiple values (as list)
-(define-syntax joy-prim-list
-  (syntax-rules ()
-    ((_ (name . args) . body)
-      (joy-set! 'name
-        (lambda ()
-          (let ((res (joy-let args (begin . body))))
-            (if (joy-err? res)
-                res
-                (begin (joy-push-list! res) (joy-ok #t)))))))))
-
-;;; ===========================================================================
-;;; MARK: Tokenization and Parsing
-;;; ===========================================================================
-
-;;; Convert a raw token string into a Scheme object:
-;;; number, boolean, symbol, character or string
-(define (joy-parse-token tok)
-  (cond
-    ((string=? tok "[") 'open-bracket)
-    ((string=? tok "]") 'close-bracket)
-    ((string=? tok ".") '.dot)
-    ((and (> (string-length tok) 1) (char=? (string-ref tok 0) #\'))
-     (let ((content (substring tok 1 (string-length tok))))
-       (cond
-         ((string=? content "\\n") #\newline)
-         ((string=? content "\\t") #\tab)
-         ((string=? content "\\r") #\return)
-         ((string=? content "\\b") #\backspace)
-         ((and (> (string-length content) 1) (char=? (string-ref content 0) #\\) (char-numeric? (string-ref content 1)))
-          (let ((code (string->number (substring content 1 (string-length content)) 8)))
-            (if code (integer->char code) (string->symbol tok))))
-         ((= (string-length content) 1) (string-ref content 0))
-         (else (string->symbol tok)))))
-    ((and (> (string-length tok) 1) (char=? (string-ref tok 0) #\"))
-     (substring tok 1 (- (string-length tok) 1)))
-    ((string->number tok) => values)
-    ((string=? tok "true") #t)
-    ((string=? tok "false") #f)
-    (else (string->symbol tok))))
-
-;;; Convert a flat token list into a Joy expression list,
-;;; properly grouping quotations with brackets
-(define (joy-parse-tokens tokens)
-  (let loop ((tokens tokens) (result '()) (quote-stack '()))
-    (cond
-      ((null? tokens)
-        (if (null? quote-stack)
-          (reverse result)
-          (joy-error "Unmatched opening bracket")))
-      ((eq? (car tokens) 'open-bracket)
-        (loop (cdr tokens) result (cons '() quote-stack)))
-      ((eq? (car tokens) 'close-bracket)
-        (if (null? quote-stack)
-          (joy-error "Unmatched closing bracket")
-          (let ((current-quote (car quote-stack))
-                (remaining-stack (cdr quote-stack)))
-            (if (null? remaining-stack)
-              (loop (cdr tokens)
-                (cons (reverse current-quote) result)
-                '())
-              (loop (cdr tokens)
-                result
-                (cons (cons (reverse current-quote)
-                        (car remaining-stack))
-                  (cdr remaining-stack)))))))
-      (else
-        (if (null? quote-stack)
-          (loop (cdr tokens)
-            (cons (car tokens) result)
-            quote-stack)
-          (loop (cdr tokens)
-            result
-            (cons (cons (car tokens) (car quote-stack))
-              (cdr quote-stack))))))))
-
-;;; Split a character list into token strings.
-;;; Handles comments (* *), # and delimiters [ ] .
-(define (joy-split chars)
-  (let loop ((chars chars) (tokens '()))
-    (cond
-      ((null? chars) (reverse tokens))
-      ((char-whitespace? (car chars)) (loop (cdr chars) tokens))
-      ((char=? (car chars) #\#) ;; line comment
-       (loop (drop-until-newline (cdr chars)) tokens))
-      ((and (char=? (car chars) #\() (not (null? (cdr chars))) (char=? (cadr chars) #\*))
-       (loop (drop-comment (cddr chars)) tokens))
-      ((char=? (car chars) #\[) (loop (cdr chars) (cons "[" tokens)))
-      ((char=? (car chars) #\]) (loop (cdr chars) (cons "]" tokens)))
-      ((char=? (car chars) #\.) (loop (cdr chars) (cons "." tokens)))
-      ((char=? (car chars) #\") (call-with-values (lambda () (read-string (cdr chars)))
-                                  (lambda (str rest) (loop rest (cons str tokens)))))
-      ((char=? (car chars) #\') (call-with-values (lambda () (read-char-literal (cdr chars)))
-                                  (lambda (chr rest) (loop rest (cons chr tokens)))))
-      (else (call-with-values (lambda () (read-word chars))
-               (lambda (tok rest) (loop rest (cons tok tokens))))))))
-
-(define (drop-until-newline chars)
-  (cond ((null? chars) '())
-        ((char=? (car chars) #\newline) (cdr chars))
-        (else (drop-until-newline (cdr chars)))))
-
-(define (drop-comment chars)
-  (cond ((null? chars) '())
-        ((and (char=? (car chars) #\*) (not (null? (cdr chars))) (char=? (cadr chars) #\)))
-         (cddr chars))
-        (else (drop-comment (cdr chars)))))
-
-(define (read-string chars)
-  (let loop ((chars chars) (acc '(#\")))
-    (cond ((null? chars) (values (list->string (reverse acc)) '()))
-          ((char=? (car chars) #\") (values (list->string (reverse (cons #\" acc))) (cdr chars)))
-          (else (loop (cdr chars) (cons (car chars) acc))))))
-
-(define (read-char-literal chars)
-  (cond ((null? chars) (values "'" '()))
-        ((char=? (car chars) #\\)
-         (let loop ((chars (cdr chars)) (acc '(#\\ #\')))
-           (cond ((null? chars) (values (list->string (reverse acc)) '()))
-                 ((char-numeric? (car chars)) (loop (cdr chars) (cons (car chars) acc)))
-                 ((member (car chars) '(#\n #\t #\r #\b))
-                  (values (list->string (reverse (cons (car chars) acc))) (cdr chars)))
-                 (else (values (list->string (reverse (cons (car chars) acc))) (cdr chars))))))
-        (else (values (string-append "'" (string (car chars))) (cdr chars)))))
-
-(define (read-word chars)
-  (let loop ((chars chars) (acc '()))
-    (cond ((null? chars) (values (list->string (reverse acc)) '()))
-          ((or (char-whitespace? (car chars))
-               (member (car chars) '(#\[ #\] #\. #\( #\# #\")))
-           (values (list->string (reverse acc)) chars))
-          (else (loop (cdr chars) (cons (car chars) acc))))))
-
-;;; Tokenize and parse a string into Joy expressions
-(define (joy-tokenize str)
-  (joy-parse-tokens (map joy-parse-token (joy-split (string->list str)))))
-
-;;; Recursive combinators
-(joy-prim-void (linrec p t r1 r2)
-  (if (and (list? p) (list? t) (list? r1) (list? r2))
-    (let rec ()
-      (joy-push! p)
-      (let ((res (joy-exec '(i))))
-        (if (joy-err? res) res
-          (let ((cond-res (joy-pop!)))
-            (if (joy-err? cond-res) cond-res
-              (if (joy-res-val cond-res)
-                (begin (joy-push! t) (joy-exec '(i)))
-                (begin (joy-push! r1)
-                       (let ((r1-res (joy-exec '(i))))
-                         (if (joy-err? r1-res) r1-res
-                           (let ((inner (rec)))
-                             (if (joy-err? inner) inner
-                               (begin (joy-push! r2) (joy-exec '(i))))))))))))))
-    (joy-err "linrec expects four quotations")))
-
-(joy-prim-void (binrec p t r1 r2)
-  (if (and (list? p) (list? t) (list? r1) (list? r2))
-    (let rec ()
-      (joy-push! p)
-      (let ((res (joy-exec '(i))))
-        (if (joy-err? res) res
-          (let ((cond-res (joy-pop!)))
-            (if (joy-err? cond-res) cond-res
-              (if (joy-res-val cond-res)
-                (begin (joy-push! t) (joy-exec '(i)))
-                (begin (joy-push! r1)
-                       (let ((r1-res (joy-exec '(i))))
-                         (if (joy-err? r1-res) r1-res
-                           (let ((inner1 (rec)))
-                             (if (joy-err? inner1) inner1
-                               (let ((inner2 (rec)))
-                                 (if (joy-err? inner2) inner2
-                                   (begin (joy-push! r2) (joy-exec '(i))))))))))))))))
-    (joy-err "binrec expects four quotations")))
-
-(define (joy-read-all)
-  (let loop ((chars '()))
-    (let ((c (read-char (current-input-port))))
-      (if (eof-object? c)
-          (joy-tokenize (list->string (reverse chars)))
-          (loop (cons c chars))))))
-
-;;; ===========================================================================
-;;; MARK: Execution Engine
-;;; ===========================================================================
-
-;;; Execute a Joy program (list of tokens)
-(define (joy-exec code)
-  (let loop ((code code))
-    (if (null? code)
-        (joy-ok #t)
-        (let ((res (joy-exec-one (car code))))
-          (if (joy-err? res)
-              res
-              (loop (cdr code)))))))
-
-;;; Evaluate a single Joy token: resolve symbol, run procedure, or push value
-(define (joy-exec-one token)
-  (cond
-    ((symbol? token)
-     (let ((val (joy-get token)))
-       (cond
-         ((procedure? val) (val))
-         ((list? val) (joy-exec val))
-         ((null? val) (joy-err (string-append "Undefined symbol: " (symbol->string token))))
-         (else (joy-push! val) (joy-ok #t)))))
-    (else (joy-push! token) (joy-ok #t))))
-
-;;; Print the current state of the Joy stack
-(define (joy-print-stack)
-  (display "Stack: ")
-  (let ((unified (append (car joy-stack) (reverse (cdr joy-stack)))))
-    (for-each (lambda (x) (joy-write x) (display " "))
-      (reverse unified)))
-  (newline))
-
-;;; Stack operations
-(define (joy-push! x)
-  (set-car! joy-stack (cons x (car joy-stack))))
-
-(define (joy-pop!)
-  (cond
-    ((pair? (car joy-stack))
-     (let ((top (caar joy-stack)))
-       (set-car! joy-stack (cdar joy-stack))
-       (joy-ok top)))
-    ((pair? (cdr joy-stack))
-     (set-car! joy-stack (reverse (cdr joy-stack)))
-     (set-cdr! joy-stack '())
-     (joy-pop!))
-    (else (joy-err "Stack underflow"))))
-
-(define (joy-peek)
-  (cond
-    ((pair? (car joy-stack)) (joy-ok (caar joy-stack)))
-    ((pair? (cdr joy-stack))
-     (set-car! joy-stack (reverse (cdr joy-stack)))
-     (set-cdr! joy-stack '())
-     (joy-peek))
-    (else (joy-err "Stack underflow on peek"))))
-
-(define (joy-stack-size)
-  (+ (length (car joy-stack)) (length (cdr joy-stack))))
-
-(define (joy-clear-stack!)
-  (set-car! joy-stack '())
-  (set-cdr! joy-stack '()))
-
-(define (joy-push-list! lst)
-  (for-each joy-push! (reverse lst)))
-
-;;; Deque-mode extension
-(define (joy-unshift! x)
-  (set-cdr! joy-stack (cons x (cdr joy-stack))))
-
-(define (joy-shift!)
-  (cond
-    ((pair? (cdr joy-stack))
-     (let ((bot (caar (cdr joy-stack))))
-       (set-cdr! joy-stack (cdar (cdr joy-stack)))
-       (joy-ok bot)))
-    ((pair? (car joy-stack))
-     (set-cdr! joy-stack (reverse (car joy-stack)))
-     (set-car! joy-stack '())
-     (joy-shift!))
-    (else (joy-err "Deque underflow"))))
-
-;;; =============================================================================
-;;; MARK: Core Joy Primitives
-;;; =============================================================================
-
-;;; Conversion and display
-(define (joy-write x)
-  (cond ((eq? x #t) (display "true"))
-        ((eq? x #f) (display "false"))
-        (else (write x))))
-
-;;; Print the top of the stack and remove it (Joy's `.`)
-(joy-prim-void (dot x)
-  (joy-write x)
-  (newline))
-
-(joy-set! '.dot (joy-get 'dot))
-
-;;; Stack inspection
-(joy-prim-void (stack) (joy-push! (append (car joy-stack) (reverse (cdr joy-stack)))))
-(joy-prim-void (env) (joy-push! joy-env))
-(joy-prim-void (peek) (let ((res (joy-peek)))
-                       (if (joy-err? res) res (begin (joy-push! (joy-res-val res)) (joy-ok #t)))))
-(joy-prim-void (size) (joy-push! (joy-stack-size)))
-(joy-prim-void (clear) (joy-clear-stack!))
-
-;;; Deque mode primitives
-(joy-prim-void (pull) (let ((res (joy-shift!)))
-                       (if (joy-err? res) res (begin (joy-push! (joy-res-val res)) (joy-ok #t)))))
-(joy-prim-void (put-bot x) (joy-unshift! x) (joy-ok #t))
-(joy-prim-void (mode) (joy-push! joy-mode))
-(joy-prim-void (set-mode m) (set! joy-mode m) (joy-ok #t))
-
-;;; Stack manipulation
-(joy-prim-list (dup x) (list x x))
-(joy-prim-void (pop x) (joy-ok #t))
-(joy-prim-list (swap x y) (list y x))
-(joy-prim-list (rot x y z) (list y z x))
-(joy-prim-list (rollup x y z) (list z x y))
-(joy-prim-list (rolldown x y z) (list y z x))
-(joy-prim-list (over x y) (list x y x))
-(joy-prim-list (pick x y z) (list x y z x))
-(joy-prim-list (tuck x y) (list y x y))
-(joy-prim (nip x y) y)
-
-;;; Dip combinators
-(joy-prim-void (dip quot)
-  (if (list? quot)
-      (let ((res (joy-pop!)))
-        (if (joy-err? res) res
-            (let ((x (joy-res-val res)))
-              (let ((exec-res (joy-exec quot)))
-                (joy-push! x)
-                exec-res))))
-      (joy-err "dip expects a quotation")))
-
-(joy-prim-void (dip2 quot x y)
-  (if (not (list? quot))
-    (joy-error "dip2 expects a quotation")
-    (begin
-      (joy-exec quot)
-      (joy-push! y)
-      (joy-push! x))))
-
-;;; Arithmetic
-(joy-prim (+ x y)
-  (cond ((and (number? x) (number? y)) (+ x y))
-        ((and (char? x) (integer? y)) (integer->char (+ (char->integer x) y)))
-        ((and (integer? x) (char? y)) (integer->char (+ x (char->integer y))))
-        (else (joy-err "type error: + expects numbers or char+int"))))
-
-(joy-prim (- x y)
-  (cond ((and (number? x) (number? y)) (- x y))
-        ((and (char? x) (integer? y)) (integer->char (- (char->integer x) y)))
-        ((and (char? x) (char? y)) (- (char->integer x) (char->integer y)))
-        (else (joy-err "type error: - expects numbers or char+int/char"))))
-(joy-prim (* x y) (* x y))
-(joy-prim (/ x y) (if (zero? y) (joy-err "Division by zero") (/ x y)))
-(joy-prim (div x y) (if (zero? y) (joy-err "Division by zero") (quotient x y)))
-(joy-prim (mod x y) (if (zero? y) (joy-err "Division by zero") (remainder x y)))
-(joy-prim (abs x) (abs x))
-(joy-prim (neg x) (- x))
-(joy-prim (sqrt x) (sqrt x))
-(joy-prim (pow x y) (expt x y))
-(joy-prim (succ x) (if (char? x) (integer->char (+ (char->integer x) 1)) (+ x 1)))
-(joy-prim (pred x) (if (char? x) (integer->char (- (char->integer x) 1)) (- x 1)))
-
-;;; Comparison
-(joy-prim (= x y) (equal? x y))
-(joy-prim (equal x y) (equal? x y))
-(joy-prim (< x y) (< x y))
-(joy-prim (> x y) (> x y))
-(joy-prim (<= x y) (<= x y))
-(joy-prim (>= x y) (>= x y))
-(joy-prim (not= x y) (not (= x y)))
-
-;;; Predicates
-(joy-prim (zero? x) (= x 0))
-(joy-prim (pos? x) (> x 0))
-(joy-prim (neg? x) (< x 0))
-(joy-prim (odd? x) (odd? x))
-(joy-prim (even? x) (even? x))
-(joy-prim (small? x) (and (integer? x) (< x 100)))
-
-;;; Logical
-(joy-prim (and x y) (and x y))
-(joy-prim (or x y) (or x y))
-(joy-prim (not x) (not x))
-
-;;; Type checking
-(joy-prim (integer? x) (integer? x))
-(joy-prim (boolean? x) (boolean? x))
-(joy-prim (list? x) (list? x))
-(joy-prim (symbol? x) (symbol? x))
-(joy-prim (char? x) (char? x))
-(joy-prim (string? x) (string? x))
-(joy-prim (null? x) (null? x))
-
-;;; Conversions
-(joy-prim (char x)
-  (cond ((integer? x) (integer->char x))
-        ((char? x) (char->integer x))
-        (else (joy-error "char expects integer or character"))))
-
-;;; List operations
-(joy-prim (cons x y) (if (list? y) (cons x y) (joy-err "cons expects a list")))
-(joy-prim (swons x y) (if (list? x) (cons y x) (joy-err "swons expects a list")))
-(joy-prim-list (uncons x) (if (pair? x) (list (car x) (cdr x)) (joy-err "uncons expects a non-empty list")))
-(joy-prim (first x) (car x))
-(joy-prim (rest x) (cdr x))
-(joy-prim (length x) (length x))
-(joy-prim (append x y) (append x y))
-(joy-prim (reverse x) (reverse x))
-(joy-prim (second x) (car (cdr x)))
-(joy-prim (third x) (car (cdr (cdr x))))
-
-;;; Helper functions for take and drop
-(define (take n lst)
-  (if (or (zero? n) (null? lst))
-    '()
-    (cons (car lst) (take (- n 1) (cdr lst)))))
-
-(define (drop n lst)
-  (if (or (zero? n) (null? lst))
-    lst
-    (drop (- n 1) (cdr lst))))
-
-(joy-prim (take n lst) (take n lst))
-(joy-prim (drop n lst) (drop n lst))
-(joy-prim (at n lst) (list-ref lst n))
-
-;;; I/O
-(joy-prim-void (print x) (write x) (newline))
-(joy-prim-void (put x) (write x) (display " "))
-
-;;; =============================================================================
-;;; MARK: Quotation Combinators
-;;; =============================================================================
-
-;;; Execute a quotation on top of the stack
-(joy-prim-void (i quot)
-  (if (list? quot)
-    (joy-exec quot)
-    (joy-err "i expects a quotation")))
-
-;;; Conditional execution: run one of two quotations based on test result
-(joy-prim-void (ifte test then-branch else-branch)
-  (if (and (list? then-branch) (list? else-branch))
-    (begin
-      (joy-push! test)
-      (let ((res (joy-exec '(i))))
-        (if (joy-err? res) res
-          (let ((cond-res (joy-pop!)))
-            (if (joy-err? cond-res) cond-res
-              (if (joy-res-val cond-res)
-                (joy-exec then-branch)
-                (joy-exec else-branch)))))))
-    (joy-err "ifte expects two quotations")))
-
-;;; Apply a quotation to each item in a list, collecting results
-(joy-prim-void (map quot lst)
-  (if (not (list? quot))
-    (joy-error "map expects a quotation")
-    (joy-push! (map (lambda (x)
-                      (joy-push! x)
-                      (joy-exec quot)
-                      (joy-pop!))
-                 lst))))
-
-;;; Apply a quotation to filter a list based on truthy result
-(joy-prim-void (filter quot lst)
-  (if (not (list? quot))
-    (joy-error "filter expects a quotation")
-    (joy-push! (filter (lambda (x)
-                         (joy-push! x)
-                         (joy-exec quot)
-                         (joy-pop!))
-                 lst))))
-
-;;; Reduce a list using a quotation and an initial value
-(joy-prim-void (fold quot init lst)
-  (if (not (list? quot))
-    (joy-error "fold expects a quotation")
-    (joy-push! (fold-left (lambda (acc x)
-                            (joy-push! acc)
-                            (joy-push! x)
-                            (joy-exec quot)
-                            (joy-pop!))
-                 init
-                 lst))))
-
-;;; Execute a quotation n times
-(joy-prim-void (times quot n)
-  (if (not (list? quot))
-    (joy-error "times expects a quotation")
-    (let loop ((count n))
-      (when (> count 0)
-        (joy-exec quot)
-        (loop (- count 1))))))
-
-;;; Repeatedly execute body while test quotation evaluates true
-(joy-prim-void (while test-quot body-quot)
-  (if (not (and (list? test-quot) (list? body-quot)))
-    (joy-error "while expects two quotations")
-    (let loop ()
-      (joy-exec test-quot)
-      (when (joy-pop!)
-        (joy-exec body-quot)
-        (loop)))))
-
-;;; Apply a quotation to each item in a list (like for-each)
-(joy-prim-void (step quot lst)
-  (if (not (list? quot))
-    (joy-error "step expects a quotation")
-    (for-each (lambda (x)
-                (joy-push! x)
-                (joy-exec quot))
-      lst)))
-
-;;; Execute one of two quotations based on boolean condition
-(joy-prim-void (branch condition then-branch else-branch)
-  (if (not (and (list? then-branch) (list? else-branch)))
-    (joy-error "branch expects two quotations")
-    (if condition
-      (joy-exec then-branch)
-      (joy-exec else-branch))))
-
-;;; Evaluate a quotation in isolation and push its result
-(joy-prim-void (nullary quot)
-  (if (not (list? quot))
-    (joy-error "nullary expects a quotation")
-    (let ((saved-f (car joy-stack)) (saved-b (cdr joy-stack)))
-      (joy-exec quot)
-      (let ((result (joy-pop!)))
-        (set-car! joy-stack saved-f)
-        (set-cdr! joy-stack saved-b)
-        (joy-push! result)))))
-
-;;; Apply a quotation to a copy of the top stack item and restore original
-(joy-prim-void (unary quot x)
-  (if (not (list? quot))
-    (joy-error "unary expects a quotation")
-    (let ((saved-f (car joy-stack)) (saved-b (cdr joy-stack)))
-      (joy-clear-stack!)
-      (joy-push! x)
-      (joy-exec quot)
-      (let ((result (joy-pop!)))
-        (set-car! joy-stack saved-f)
-        (set-cdr! joy-stack saved-b)
-        (joy-push! x)
-        (joy-push! result)))))
-
-;;; Apply a quotation to the top two stack items, restore originals, and push result
-(joy-prim-void (binary quot x y)
-  (if (not (list? quot))
-    (joy-error "binary expects a quotation")
-    (let ((saved-f (car joy-stack)) (saved-b (cdr joy-stack)))
-      (joy-clear-stack!)
-      (joy-push! y)
-      (joy-push! x)
-      (joy-exec quot)
-      (let ((result (joy-pop!)))
-        (set-car! joy-stack saved-f)
-        (set-cdr! joy-stack saved-b)
-        (joy-push! y)
-        (joy-push! x)
-        (joy-push! result)))))
-
-;;; =============================================================================
-;;; MARK: Result-type Error Handling
-;;; =============================================================================
-
-(joy-define ok [ok] cons)
-(joy-define error [error] cons)
-(joy-define is-ok? first [ok] =)
-(joy-define is-error? first [error] =)
-(joy-define unwrap-ok rest first)
-(joy-define unwrap-error rest first)
-
-(joy-define safe-div
-  [0 =]
-  [pop "Division by zero" error]
-  [/ ok]
-  ifte)
-
-;;; Execute a quotation and wrap result in [ok ...] or [error ...]
-(joy-prim-void (try-exec quot)
-  (if (not (list? quot))
-    (joy-error "try-exec expects a quotation")
-    (guard (ex (else (joy-push! `[error ,(condition-message ex)])))
-      (joy-exec quot)
-      (let ((result (joy-pop!)))
-        (joy-push! `[ok ,result])))))
-
-(joy-define result-bind
-  [is-error?]
-  []
-  [unwrap-ok swap i]
-  ifte)
-
-(joy-define result-map
-  [is-error?]
-  []
-  [unwrap-ok swap i ok]
-  ifte)
-
-(joy-define result-chain
-  [null?]
-  []
-  [uncons swap result-bind result-chain]
-  ifte)
-
-;;; =============================================================================
-;;; MARK: Assorted Joy Definitions
-;;; =============================================================================
-
-(joy-define square dup *)
-(joy-define cube dup dup * *)
-(joy-define twice dup +)
-(joy-define factorial [1 =] [pop 1] [dup 1 - factorial *] ifte)
-(joy-define sum 0 [+] fold)
-(joy-define product 1 [*] fold)
-(joy-define max [>] [swap] [] ifte)
-(joy-define min [<] [swap] [] ifte)
-
-(joy-define range [0 =] [pop []] [dup 1 - range cons] ifte)
-
-(joy-define safe-sqrt
-  [0 <]
-  ["Negative square root" error]
-  [sqrt ok]
-  ifte)
-
-(joy-define parse-int
-  [integer?]
-  [ok]
-  ["Not an integer" error]
-  ifte)
-
-;;; =============================================================================
-;;; MARK: REPL
-;;; =============================================================================
-
-;;; Start the Joy interactive shell (REPL)
-(define (joy-repl)
-  (let ((line (get-line (current-input-port))))
-    (cond
-      ((eof-object? line)
-        (display "Goodbye.\n"))
-      (else
-        (guard (ex (else (display "Error: ") (display (condition-message ex)) (newline)))
-          (joy-exec (joy-tokenize line))
-          (joy-print-stack))
-        (joy-repl)))))
-
-(joy-prim-void (help)
-  (for-each (lambda (x) (display x) (newline))
-    '("Joy Interpreter Commands:"
-       "  Stack: dup pop swap rot rollup rolldown size clear"
-       "  Arithmetic: + - * / div mod abs neg sqrt pow"
-       "  Comparison: = < > <= >= not="
-       "  Logical: and or not"
-       "  Lists: cons uncons first rest length append reverse"
-       "  Quotations: i ifte map filter fold times while"
-       "  Types: integer? boolean? list? symbol? null?"
-       "  I/O: print put"
-       "  Examples: square cube factorial sum product"
-       "  Use [ ] for quotations, e.g., [1 2 3] [dup *] map")))
-
-;;; Result words
-(joy-define ok [ok] swons)
-(joy-define err [err] swons)
-(joy-define ok? first ok =)
-(joy-define err? first err =)
-(joy-define unwrap rest first)
-
-;;; Entry point logic
-(let ((args (command-line-arguments)))
-  (cond
-    ((null? args)
-     (display "Joy Interpreter. Type 'help' for commands.\n")
-     (joy-repl))
-    (else
-     (joy-exec (joy-read-all))
-     (joy-print-stack))))
-(define (joy-pop!)
-  (cond
-    ((pair? (car joy-stack))
-     (let ((top (caar joy-stack)))
-       (set-car! joy-stack (cdar joy-stack))
-       (joy-ok top)))
-    ((pair? (cdr joy-stack))
-     (set-car! joy-stack (reverse (cdr joy-stack)))
-     (set-cdr! joy-stack '())
-     (joy-pop!))
-    (else (joy-err "Stack underflow"))))
-
-(define (joy-peek)
-  (cond
-    ((pair? (car joy-stack)) (joy-ok (caar joy-stack)))
-    ((pair? (cdr joy-stack))
-     (set-car! joy-stack (reverse (cdr joy-stack)))
-     (set-cdr! joy-stack '())
-     (joy-peek))
-    (else (joy-err "Stack underflow on peek"))))
-
-(define (joy-stack-size)
-  (+ (length (car joy-stack)) (length (cdr joy-stack))))
-
-(define (joy-clear-stack!)
-  (set-car! joy-stack '())
-  (set-cdr! joy-stack '()))
-
-(define (joy-push-list! lst)
-  (for-each joy-push! (reverse lst)))
-
-;;; Deque-mode extension
-(define (joy-unshift! x)
-  (set-cdr! joy-stack (cons x (cdr joy-stack))))
-
-(define (joy-shift!)
-  (cond
-    ((pair? (cdr joy-stack))
-     (let ((bot (cadr joy-stack)))
-       (set-cdr! joy-stack (cddr joy-stack))
-       bot))
-    ((pair? (car joy-stack))
-     (set-cdr! joy-stack (reverse (car joy-stack)))
-     (set-car! joy-stack '())
-     (joy-shift!))
-    (else (joy-error "Deque underflow"))))
-
-;;; ===========================================================================
-;;; MARK: Tokenization and Parsing
-;;; ===========================================================================
-
-;;; Convert a raw token string into a Scheme object:
-;;; number, boolean, symbol, character or string
-(define (joy-parse-token tok)
-  (cond
-    ((string=? tok "[") 'open-bracket)
-    ((string=? tok "]") 'close-bracket)
-    ((string=? tok ".") '.dot)
-    ((and (> (string-length tok) 1) (char=? (string-ref tok 0) #\'))
-     (let ((content (substring tok 1 (string-length tok))))
-       (cond
-         ((string=? content "\\n") #\newline)
-         ((string=? content "\\t") #\tab)
-         ((string=? content "\\r") #\return)
-         ((string=? content "\\b") #\backspace)
-         ((and (> (string-length content) 1) (char=? (string-ref content 0) #\\) (char-numeric? (string-ref content 1)))
-          (let ((code (string->number (substring content 1 (string-length content)) 8)))
-            (if code (integer->char code) (string->symbol tok))))
-         ((= (string-length content) 1) (string-ref content 0))
-         (else (string->symbol tok)))))
-    ((and (> (string-length tok) 1) (char=? (string-ref tok 0) #\"))
-     (substring tok 1 (- (string-length tok) 1)))
-    ((string->number tok) => values)
-    ((string=? tok "true") #t)
-    ((string=? tok "false") #f)
-    (else (string->symbol tok))))
-
-;;; Convert a flat token list into a Joy expression list,
-;;; properly grouping quotations with brackets
-(define (joy-parse-tokens tokens)
-  (let loop ((tokens tokens) (result '()) (quote-stack '()))
-    (cond
-      ((null? tokens)
-        (if (null? quote-stack)
-          (reverse result)
-          (joy-error "Unmatched opening bracket")))
-      ((eq? (car tokens) 'open-bracket)
-        (loop (cdr tokens) result (cons '() quote-stack)))
-      ((eq? (car tokens) 'close-bracket)
-        (if (null? quote-stack)
-          (joy-error "Unmatched closing bracket")
-          (let ((current-quote (car quote-stack))
-                (remaining-stack (cdr quote-stack)))
-            (if (null? remaining-stack)
-              (loop (cdr tokens)
-                (cons (reverse current-quote) result)
-                '())
-              (loop (cdr tokens)
-                result
-                (cons (cons (reverse current-quote)
-                        (car remaining-stack))
-                  (cdr remaining-stack)))))))
-      (else
-        (if (null? quote-stack)
-          (loop (cdr tokens)
-            (cons (car tokens) result)
-            quote-stack)
-          (loop (cdr tokens)
-            result
-            (cons (cons (car tokens) (car quote-stack))
-              (cdr quote-stack))))))))
-
-;;; Split a character list into token strings.
-;;; Handles comments (* *), # and delimiters [ ] .
-(define (joy-split chars)
-  (let loop ((chars chars) (tokens '()))
-    (cond
-      ((null? chars) (reverse tokens))
-      ((char-whitespace? (car chars)) (loop (cdr chars) tokens))
-      ((char=? (car chars) #\#) ;; line comment
-       (loop (drop-until-newline (cdr chars)) tokens))
-      ((and (char=? (car chars) #\() (not (null? (cdr chars))) (char=? (cadr chars) #\*))
-       (loop (drop-comment (cddr chars)) tokens))
-      ((char=? (car chars) #\[) (loop (cdr chars) (cons "[" tokens)))
-      ((char=? (car chars) #\]) (loop (cdr chars) (cons "]" tokens)))
-      ((char=? (car chars) #\.) (loop (cdr chars) (cons "." tokens)))
-      ((char=? (car chars) #\") (call-with-values (lambda () (read-string (cdr chars)))
-                                  (lambda (str rest) (loop rest (cons str tokens)))))
-      ((char=? (car chars) #\') (call-with-values (lambda () (read-char-literal (cdr chars)))
-                                  (lambda (chr rest) (loop rest (cons chr tokens)))))
-      (else (call-with-values (lambda () (read-word chars))
-               (lambda (tok rest) (loop rest (cons tok tokens))))))))
-
-(define (drop-until-newline chars)
-  (cond ((null? chars) '())
-        ((char=? (car chars) #\newline) (cdr chars))
-        (else (drop-until-newline (cdr chars)))))
-
-(define (drop-comment chars)
-  (cond ((null? chars) '())
-        ((and (char=? (car chars) #\*) (not (null? (cdr chars))) (char=? (cadr chars) #\)))
-         (cddr chars))
-        (else (drop-comment (cdr chars)))))
-
-(define (read-string chars)
-  (let loop ((chars chars) (acc '(#\")))
-    (cond ((null? chars) (values (list->string (reverse acc)) '()))
-          ((char=? (car chars) #\") (values (list->string (reverse (cons #\" acc))) (cdr chars)))
-          (else (loop (cdr chars) (cons (car chars) acc))))))
-
-(define (read-char-literal chars)
-  (cond ((null? chars) (values "'" '()))
-        ((char=? (car chars) #\\)
-         (let loop ((chars (cdr chars)) (acc '(#\\ #\')))
-           (cond ((null? chars) (values (list->string (reverse acc)) '()))
-                 ((char-numeric? (car chars)) (loop (cdr chars) (cons (car chars) acc)))
-                 ((member (car chars) '(#\n #\t #\r #\b))
-                  (values (list->string (reverse (cons (car chars) acc))) (cdr chars)))
-                 (else (values (list->string (reverse (cons (car chars) acc))) (cdr chars))))))
-        (else (values (string-append "'" (string (car chars))) (cdr chars)))))
-
-(define (read-word chars)
-  (let loop ((chars chars) (acc '()))
-    (cond ((null? chars) (values (list->string (reverse acc)) '()))
-          ((or (char-whitespace? (car chars))
-               (member (car chars) '(#\[ #\] #\. #\( #\# #\")))
-           (values (list->string (reverse acc)) chars))
-          (else (loop (cdr chars) (cons (car chars) acc))))))
-
-;;; Tokenize and parse a string into Joy expressions
-(define (joy-tokenize str)
-  (joy-parse-tokens (map joy-parse-token (joy-split (string->list str)))))
-
-;;; Read and parse Joy input from the user or file
-(define (joy-read-all)
-  (let loop ((chars '()))
-    (let ((c (read-char (current-input-port))))
-      (if (eof-object? c)
-          (joy-tokenize (list->string (reverse chars)))
-          (loop (cons c chars))))))
-
-;;; ===========================================================================
-;;; MARK: Execution Engine
-;;; ===========================================================================
-
-;;; Execute a Joy program (list of tokens)
-(define (joy-exec code)
-  (let loop ((code code))
-    (if (null? code)
-        (joy-ok #t)
-        (let ((res (joy-exec-one (car code))))
-          (if (joy-err? res)
-              res
-              (loop (cdr code)))))))
-
-;;; Evaluate a single Joy token: resolve symbol, run procedure, or push value
-(define (joy-exec-one token)
-  (cond
-    ((symbol? token)
-     (let ((val (joy-get token)))
-       (cond
-         ((procedure? val) (val))
-         ((list? val) (joy-exec val))
-         ((null? val) (joy-err (string-append "Undefined symbol: " (symbol->string token))))
-         (else (joy-push! val) (joy-ok #t)))))
-    (else (joy-push! token) (joy-ok #t))))
-
-;;; Print the current state of the Joy stack
-(define (joy-print-stack)
-  (display "Stack: ")
-  (let ((unified (append (car joy-stack) (reverse (cdr joy-stack)))))
-    (for-each (lambda (x) (joy-write x) (display " "))
-      (reverse unified)))
-  (newline))
-
-;;; ===========================================================================
-;;; MARK: Macro Definitions
-;;; ===========================================================================
-
-(define-syntax joy-define
-  (syntax-rules ()
-    ((_ name body ...)
-      (joy-set! 'name '(body ...)))))
-
-;;; Define a Joy word that returns a single result
-(define-syntax joy-prim
-  (syntax-rules ()
-    ((_ (name . args) . body)
-      (joy-set! 'name
-        (lambda ()
-          (joy-let args
-            (let ((res (begin . body)))
-              (if (joy-err? res)
-                  res
-                  (begin (joy-push! res) (joy-ok #t))))))))))
-
-;;; Define a Joy word that performs side effects without returning a value
-(define-syntax joy-prim-void
-  (syntax-rules ()
-    ((_ (name . args) . body)
-      (joy-set! 'name
-        (lambda ()
-          (joy-let args
-            (begin . body)
-            (joy-ok #t)))))))
-
-;;; Define a Joy word that returns multiple values (as list)
-(define-syntax joy-prim-list
-  (syntax-rules ()
-    ((_ (name . args) . body)
-      (joy-set! 'name
-        (lambda ()
-          (joy-let args
-            (let ((res (begin . body)))
-              (if (joy-err? res)
-                  res
-                  (begin (joy-push-list! res) (joy-ok #t))))))))))
-
-;;; Pattern-match and bind Joy stack arguments to variables
-(define-syntax joy-let
-  (syntax-rules ()
-    ((_ () . body)
-      (begin . body))
-    ((_ (x . rest) . body)
-      (let ((res (joy-pop!)))
-        (if (joy-err? res)
-            res
-            (let ((x (joy-res-val res)))
-              (joy-let rest . body)))))))
-
-;;; =============================================================================
-;;; MARK: Core Joy Primitives
-;;; =============================================================================
-
-;;; Conversion and display
-(define (joy-write x)
-  (cond ((eq? x #t) (display "true"))
-        ((eq? x #f) (display "false"))
-        (else (write x))))
-
-;;; Print the top of the stack and remove it (Joy's `.`)
-(joy-prim-void (dot x)
-  (joy-write x)
-  (newline))
-
-(joy-set! '.dot (joy-get 'dot))
-
-;;; Stack inspection
-(joy-prim-void (stack) (joy-push! (append (car joy-stack) (reverse (cdr joy-stack)))))
-(joy-prim-void (env) (joy-push! joy-env))
-(joy-prim-void (peek) (let ((res (joy-peek)))
-                       (if (joy-err? res) res (begin (joy-push! (joy-res-val res)) (joy-ok #t)))))
-(joy-prim-void (size) (joy-push! (joy-stack-size)))
-(joy-prim-void (clear) (joy-clear-stack!))
-
-;;; Stack manipulation
-(joy-prim-list (dup x) (list x x))
-(joy-prim-void (pop x) #f)
-(joy-prim-list (swap x y) (list y x))
-(joy-prim-list (rot x y z) (list y z x))
-(joy-prim-list (rollup x y z) (list z x y))
-(joy-prim-list (rolldown x y z) (list y z x))
-(joy-prim-list (over x y) (list x y x))
-(joy-prim-list (pick x y z) (list x y z x))
-(joy-prim-list (tuck x y) (list y x y))
-(joy-prim (nip x y) y)
-
-;;; Dip combinators
-(joy-prim-void (dip quot x)
-  (if (not (list? quot))
-    (joy-error "dip expects a quotation")
-    (begin
-      (joy-exec quot)
-      (joy-push! x))))
-
-(joy-prim-void (dip2 quot x y)
-  (if (not (list? quot))
-    (joy-error "dip2 expects a quotation")
-    (begin
-      (joy-exec quot)
-      (joy-push! y)
-      (joy-push! x))))
-
-;;; Arithmetic
-(joy-prim (+ x y)
-  (cond ((and (number? x) (number? y)) (+ x y))
-        ((and (char? x) (integer? y)) (integer->char (+ (char->integer x) y)))
-        ((and (integer? x) (char? y)) (integer->char (+ x (char->integer y))))
-        (else (joy-err "type error: + expects numbers or char+int"))))
-
-(joy-prim (- x y)
-  (cond ((and (number? x) (number? y)) (- x y))
-        ((and (char? x) (integer? y)) (integer->char (- (char->integer x) y)))
-        ((and (char? x) (char? y)) (- (char->integer x) (char->integer y)))
-        (else (joy-err "type error: - expects numbers or char+int/char"))))
-(joy-prim (* x y) (* x y))
-(joy-prim (/ x y) (if (zero? y) (joy-err "Division by zero") (/ x y)))
-(joy-prim (div x y) (if (zero? y) (joy-err "Division by zero") (quotient x y)))
-(joy-prim (mod x y) (if (zero? y) (joy-err "Division by zero") (remainder x y)))
-(joy-prim (abs x) (abs x))
-(joy-prim (neg x) (- x))
-(joy-prim (sqrt x) (sqrt x))
-(joy-prim (pow x y) (expt x y))
-(joy-prim (succ x) (if (char? x) (integer->char (+ (char->integer x) 1)) (+ x 1)))
-(joy-prim (pred x) (if (char? x) (integer->char (- (char->integer x) 1)) (- x 1)))
-
-;;; Comparison
-(joy-prim (= x y) (equal? x y))
-(joy-prim (equal x y) (equal? x y))
-(joy-prim (< x y) (< x y))
-(joy-prim (> x y) (> x y))
-(joy-prim (<= x y) (<= x y))
-(joy-prim (>= x y) (>= x y))
-(joy-prim (not= x y) (not (= x y)))
-
-;;; Predicates
-(joy-prim (zero? x) (= x 0))
-(joy-prim (pos? x) (> x 0))
-(joy-prim (neg? x) (< x 0))
-(joy-prim (odd? x) (odd? x))
-(joy-prim (even? x) (even? x))
-(joy-prim (small? x) (and (integer? x) (< x 100)))
-
-;;; Logical
-(joy-prim (and x y) (and x y))
-(joy-prim (or x y) (or x y))
-(joy-prim (not x) (not x))
-
-;;; Type checking
-(joy-prim (integer? x) (integer? x))
-(joy-prim (boolean? x) (boolean? x))
-(joy-prim (list? x) (list? x))
-(joy-prim (symbol? x) (symbol? x))
-(joy-prim (char? x) (char? x))
-(joy-prim (string? x) (string? x))
-(joy-prim (null? x) (null? x))
-
-;;; Conversions
-(joy-prim (char x)
-  (cond ((integer? x) (integer->char x))
-        ((char? x) (char->integer x))
-        (else (joy-error "char expects integer or character"))))
-
-;;; List operations
-(joy-prim (cons x y) (cons x y))
-(joy-prim-list (uncons x) (list (car x) (cdr x)))
-(joy-prim (first x) (car x))
-(joy-prim (rest x) (cdr x))
-(joy-prim (length x) (length x))
-(joy-prim (append x y) (append x y))
-(joy-prim (reverse x) (reverse x))
-(joy-prim (second x) (car (cdr x)))
-(joy-prim (third x) (car (cdr (cdr x))))
-
-;;; Helper functions for take and drop
-(define (take n lst)
-  (if (or (zero? n) (null? lst))
-    '()
-    (cons (car lst) (take (- n 1) (cdr lst)))))
-
-(define (drop n lst)
-  (if (or (zero? n) (null? lst))
-    lst
-    (drop (- n 1) (cdr lst))))
-
-(joy-prim (take n lst) (take n lst))
-(joy-prim (drop n lst) (drop n lst))
-(joy-prim (at n lst) (list-ref lst n))
-
-;;; I/O
-(joy-prim-void (print x) (write x) (newline))
-(joy-prim-void (put x) (write x) (display " "))
-
-;;; =============================================================================
-;;; MARK: Quotation Combinators
-;;; =============================================================================
-
-;;; Execute a quotation on top of the stack
-(joy-prim-void (i quot)
-  (if (list? quot)
-    (joy-exec quot)
-    (joy-error "i expects a quotation")))
-
-;;; Conditional execution: run one of two quotations based on test result
-(joy-prim-void (ifte test then-branch else-branch)
-  (if (not (and (list? then-branch) (list? else-branch)))
-    (joy-error "ifte expects two quotations")
-    (begin
-      (joy-push! test)
-      (joy-exec '(i))
-      (let ((condition (joy-pop!)))
-        (if condition
-          (joy-exec then-branch)
-          (joy-exec else-branch))))))
-
-;;; Apply a quotation to each item in a list, collecting results
-(joy-prim-void (map quot lst)
-  (if (not (list? quot))
-    (joy-error "map expects a quotation")
-    (joy-push! (map (lambda (x)
-                      (joy-push! x)
-                      (joy-exec quot)
-                      (joy-pop!))
-                 lst))))
-
-;;; Apply a quotation to filter a list based on truthy result
-(joy-prim-void (filter quot lst)
-  (if (not (list? quot))
-    (joy-error "filter expects a quotation")
-    (joy-push! (filter (lambda (x)
-                         (joy-push! x)
-                         (joy-exec quot)
-                         (joy-pop!))
-                 lst))))
-
-;;; Reduce a list using a quotation and an initial value
-(joy-prim-void (fold quot init lst)
-  (if (not (list? quot))
-    (joy-error "fold expects a quotation")
-    (joy-push! (fold-left (lambda (acc x)
-                            (joy-push! acc)
-                            (joy-push! x)
-                            (joy-exec quot)
-                            (joy-pop!))
-                 init
-                 lst))))
-
-;;; Execute a quotation n times
-(joy-prim-void (times quot n)
-  (if (not (list? quot))
-    (joy-error "times expects a quotation")
-    (let loop ((count n))
-      (when (> count 0)
-        (joy-exec quot)
-        (loop (- count 1))))))
-
-;;; Repeatedly execute body while test quotation evaluates true
-(joy-prim-void (while test-quot body-quot)
-  (if (not (and (list? test-quot) (list? body-quot)))
-    (joy-error "while expects two quotations")
-    (let loop ()
-      (joy-exec test-quot)
-      (when (joy-pop!)
-        (joy-exec body-quot)
-        (loop)))))
-
-;;; Apply a quotation to each item in a list (like for-each)
-(joy-prim-void (step quot lst)
-  (if (not (list? quot))
-    (joy-error "step expects a quotation")
-    (for-each (lambda (x)
-                (joy-push! x)
-                (joy-exec quot))
-      lst)))
-
-;;; Execute one of two quotations based on boolean condition
-(joy-prim-void (branch condition then-branch else-branch)
-  (if (not (and (list? then-branch) (list? else-branch)))
-    (joy-error "branch expects two quotations")
-    (if condition
-      (joy-exec then-branch)
-      (joy-exec else-branch))))
-
-;;; Evaluate a quotation in isolation and push its result
-(joy-prim-void (nullary quot)
-  (if (not (list? quot))
-    (joy-error "nullary expects a quotation")
-    (let ((saved-f (car joy-stack)) (saved-b (cdr joy-stack)))
-      (joy-exec quot)
-      (let ((result (joy-pop!)))
-        (set-car! joy-stack saved-f)
-        (set-cdr! joy-stack saved-b)
-        (joy-push! result)))))
-
-;;; Apply a quotation to a copy of the top stack item and restore original
-(joy-prim-void (unary quot x)
-  (if (not (list? quot))
-    (joy-error "unary expects a quotation")
-    (let ((saved-f (car joy-stack)) (saved-b (cdr joy-stack)))
-      (joy-clear-stack!)
-      (joy-push! x)
-      (joy-exec quot)
-      (let ((result (joy-pop!)))
-        (set-car! joy-stack saved-f)
-        (set-cdr! joy-stack saved-b)
-        (joy-push! x)
-        (joy-push! result)))))
-
-;;; Apply a quotation to the top two stack items, restore originals, and push result
-(joy-prim-void (binary quot x y)
-  (if (not (list? quot))
-    (joy-error "binary expects a quotation")
-    (let ((saved-f (car joy-stack)) (saved-b (cdr joy-stack)))
-      (joy-clear-stack!)
-      (joy-push! y)
-      (joy-push! x)
-      (joy-exec quot)
-      (let ((result (joy-pop!)))
-        (set-car! joy-stack saved-f)
-        (set-cdr! joy-stack saved-b)
-        (joy-push! y)
-        (joy-push! x)
-        (joy-push! result)))))
-
-;;; =============================================================================
-;;; MARK: Result-type Error Handling
-;;; =============================================================================
-
-(joy-define ok [ok] cons)
-(joy-define error [error] cons)
-(joy-define is-ok? first [ok] =)
-(joy-define is-error? first [error] =)
-(joy-define unwrap-ok rest first)
-(joy-define unwrap-error rest first)
-
-(joy-define safe-div
-  [0 =]
-  [pop "Division by zero" error]
-  [/ ok]
-  ifte)
-
-;;; Execute a quotation and wrap result in [ok ...] or [error ...]
-(joy-prim-void (try-exec quot)
-  (if (not (list? quot))
-    (joy-error "try-exec expects a quotation")
-    (guard (ex (else (joy-push! `[error ,(condition-message ex)])))
-      (joy-exec quot)
-      (let ((result (joy-pop!)))
-        (joy-push! `[ok ,result])))))
-
-(joy-define result-bind
-  [is-error?]
-  []
-  [unwrap-ok swap i]
-  ifte)
-
-(joy-define result-map
-  [is-error?]
-  []
-  [unwrap-ok swap i ok]
-  ifte)
-
-(joy-define result-chain
-  [null?]
-  []
-  [uncons swap result-bind result-chain]
-  ifte)
-
-;;; =============================================================================
-;;; MARK: Assorted Joy Definitions
-;;; =============================================================================
-
-(joy-define square dup *)
-(joy-define cube dup dup * *)
-(joy-define twice dup +)
-(joy-define factorial [1 =] [pop 1] [dup 1 - factorial *] ifte)
-(joy-define sum 0 [+] fold)
-(joy-define product 1 [*] fold)
-(joy-define max [>] [swap] [] ifte)
-(joy-define min [<] [swap] [] ifte)
-
-(joy-define range [0 =] [pop []] [dup 1 - range cons] ifte)
-
-(joy-define safe-sqrt
-  [0 <]
-  ["Negative square root" error]
-  [sqrt ok]
-  ifte)
-
-(joy-define parse-int
-  [integer?]
-  [ok]
-  ["Not an integer" error]
-  ifte)
-
-;;; =============================================================================
-;;; MARK: REPL
-;;; =============================================================================
-
-;;; Start the Joy interactive shell (REPL)
-(define (joy-repl)
-  (let ((line (get-line (current-input-port))))
-    (cond
-      ((eof-object? line)
-        (display "Goodbye.\n"))
-      (else
-        (guard (ex (else (display "Error: ") (display (condition-message ex)) (newline)))
-          (joy-exec (joy-tokenize line))
-          (joy-print-stack))
-        (joy-repl)))))
-
-(joy-prim-void (help)
-  (for-each (lambda (x) (display x) (newline))
-    '("Joy Interpreter Commands:"
-       "  Stack: dup pop swap rot rollup rolldown size clear"
-       "  Arithmetic: + - * / div mod abs neg sqrt pow"
-       "  Comparison: = < > <= >= not="
-       "  Logical: and or not"
-       "  Lists: cons uncons first rest length append reverse"
-       "  Quotations: i ifte map filter fold times while"
-       "  Types: integer? boolean? list? symbol? null?"
-       "  I/O: print put"
-       "  Examples: square cube factorial sum product"
-       "  Use [ ] for quotations, e.g., [1 2 3] [dup *] map")))
-
-;;; Result words
-(joy-define ok [ok] cons)
-(joy-define err [err] cons)
-(joy-define ok? first [ok] equal)
-(joy-define err? first [err] equal)
-(joy-define map-ok [ok?] [rest first swap i ok] [] ifte)
-(joy-define bind-ok [ok?] [rest first swap i] [] ifte)
-
-;;; Entry point logic
-(let ((args (command-line-arguments)))
-  (cond
-    ((null? args)
-     (display "Joy Interpreter. Type 'help' for commands.\n")
-     (joy-repl))
-    (else
-     (joy-exec (joy-read-all))
-     (joy-print-stack))))
-  (hashtable-set! joy-env sym val))
-
-(define (joy-push! x)
-  (set! joy-stack (cons x joy-stack)))
-
-(define (joy-pop!)
-  (if (null? joy-stack)
-    (joy-error "Stack underflow")
-    (let ((top (car joy-stack)))
-      (set! joy-stack (cdr joy-stack))
-      top)))
-
-(define (joy-peek)
-  (if (null? joy-stack)
-    (joy-error "Stack underflow on peek")
-    (car joy-stack)))
-
-(define (joy-stack-size)
-  (length joy-stack))
-
-(define (joy-clear-stack!)
-  (set! joy-stack '()))
-
-(define (joy-push-list! lst)
-  (for-each joy-push! (reverse lst)))
-
-;;; ===========================================================================
-;;; MARK: Tokenization and Parsing
-;;; ===========================================================================
-
-;;; Convert a raw token string into a Scheme object:
-;;; number, boolean, symbol, or quotation bracket
-(define (joy-parse-token tok)
-  (cond
-    ((string=? tok "[") 'open-bracket)
-    ((string=? tok "]") 'close-bracket)
-    ((string=? tok ".") '.dot)
-    ((string->number tok) => values)
-    ((string=? tok "true") #t)
-    ((string=? tok "false") #f)
-    (else (string->symbol tok))))
-
-;;; Convert a flat token list into a Joy expression list,
-;;; properly grouping quotations with brackets
-(define (joy-parse-tokens tokens)
-  (let loop ((tokens tokens) (result '()) (quote-stack '()))
-    (cond
-      ((null? tokens)
-        (if (null? quote-stack)
-          (reverse result)
-          (joy-error "Unmatched opening bracket")))
-      ((eq? (car tokens) 'open-bracket)
-        (loop (cdr tokens) result (cons '() quote-stack)))
-      ((eq? (car tokens) 'close-bracket)
-        (if (null? quote-stack)
-          (joy-error "Unmatched closing bracket")
-          (let ((current-quote (car quote-stack))
-                (remaining-stack (cdr quote-stack)))
-            (if (null? remaining-stack)
-              (loop (cdr tokens)
-                (cons (reverse current-quote) result)
-                '())
-              (loop (cdr tokens)
-                result
-                (cons (cons (reverse current-quote)
-                        (car remaining-stack))
-                  (cdr remaining-stack)))))))
-      (else
-        (if (null? quote-stack)
-          (loop (cdr tokens)
-            (cons (car tokens) result)
-            quote-stack)
-          (loop (cdr tokens)
-            result
-            (cons (cons (car tokens) (car quote-stack))
-              (cdr quote-stack))))))))
-
-;;; Split a character list into token strings.
-;;; Treats whitespace as separator and brackets as distinct tokens.
-(define (joy-split chars)
-  (define (whitespace? c) (member c '(#\space #\tab #\newline)))
-  (define (delimiter? c) (member c '(#\[ #\])))
-  (define (next-token acc chars)
-    (cond
-      ((null? chars) 
-        (if (null? acc) '() (list (list->string (reverse acc)))))
-      ((whitespace? (car chars))
-        (if (null? acc)
-          (next-token '() (cdr chars))
-          (cons (list->string (reverse acc)) (next-token '() (cdr chars)))))
-      ((delimiter? (car chars))
-        (if (null? acc)
-          (cons (string (car chars)) (next-token '() (cdr chars)))
-          (cons (list->string (reverse acc))
-            (cons (string (car chars)) (next-token '() (cdr chars))))))
-      (else
-        (next-token (cons (car chars) acc) (cdr chars)))))
-  (next-token '() chars))
-
-;;; Tokenize and parse a string into Joy expressions
-(define (joy-tokenize str)
-  (joy-parse-tokens (map joy-parse-token (joy-split (string->list str)))))
-
-;;; Read and parse one line of Joy input from the user
-(define (joy-read-line)
-  (let ((line (get-line (current-input-port))))
-    (if (eof-object? line)
-      line
-      (joy-tokenize line))))
-
-;;; ===========================================================================
-;;; MARK: Execution Engine
-;;; ===========================================================================
-
-;;; Execute a Joy program (list of tokens)
-(define (joy-exec code)
-  (for-each joy-exec-one code))
-
-;;; Evaluate a single Joy token: resolve symbol, run procedure, or push value
-(define (joy-exec-one token)
-  (cond
-    ((symbol? token)
-      (let ((val (joy-get token)))
-        (cond
-          ((procedure? val) (val))
-          ((list? val) (joy-exec val))
-          ((null? val) (joy-error "Undefined symbol: " (symbol->string token)))
-          (else (joy-push! val)))))
-    (else (joy-push! token))))
-
-;;; Print the current state of the Joy stack
-(define (joy-print-stack)
-  (display "Stack: ")
-  (for-each (lambda (x)
-              (write x)
-              (display " "))
-    (reverse joy-stack))
-  (newline))
-
-;;; ===========================================================================
-;;; MARK: Macro Definitions
-;;; ===========================================================================
-
-(define-syntax joy-define
-  (syntax-rules ()
-    ((_ name body ...)
-      (joy-set! 'name '(body ...)))))
-
-;;; Define a Joy word that returns a single result
-(define-syntax joy-prim
-  (syntax-rules ()
-    ((_ (name . args) . body)
-      (joy-set! 'name
-        (lambda ()
-          (joy-let args
-            (joy-push! (begin . body))))))))
-
-;;; Define a Joy word that performs side effects without returning a value
-(define-syntax joy-prim-void
-  (syntax-rules ()
-    ((_ (name . args) . body)
-      (joy-set! 'name
-        (lambda ()
-          (joy-let args
-            (begin . body)))))))
-
-;;; Define a Joy word that returns multiple values (as list)
-(define-syntax joy-prim-list
-  (syntax-rules ()
-    ((_ (name . args) . body)
-      (joy-set! 'name
-        (lambda ()
-          (joy-let args
-            (joy-push-list! (begin . body))))))))
-
-;;; Pattern-match and bind Joy stack arguments to variables
-(define-syntax joy-let
-  (syntax-rules ()
-    ((_ () . body)
-      (begin . body))
-    ((_ (x . rest) . body)
-      (let ((x (joy-pop!)))
-        (joy-let rest . body)))))
-
-;;; =============================================================================
-;;; MARK: Core Joy Primitives
-;;; =============================================================================
-
-;;; Print the top of the stack and remove it (Joy's `.`)
-(joy-prim-void (dot x)
-  (write x)
-  (newline))
-
-(joy-set! '.dot (joy-get 'dot))
-
-
-;;; Stack inspection
-(joy-prim-void (stack) (joy-push! joy-stack))
-(joy-prim-void (env) (joy-push! joy-env))
-(joy-prim-void (peek) (joy-push! (joy-peek)))
-(joy-prim-void (size) (joy-push! (joy-stack-size)))
-(joy-prim-void (clear) (joy-clear-stack!))
-
-;;; Stack manipulation
-(joy-prim-list (dup x) (list x x))
-(joy-prim-void (pop x) #f)
-(joy-prim-list (swap x y) (list y x))
-(joy-prim-list (rot x y z) (list y z x))
-(joy-prim-list (rollup x y z) (list z x y))
-(joy-prim-list (rolldown x y z) (list y z x))
-(joy-prim-list (over x y) (list x y x))
-(joy-prim-list (pick x y z) (list x y z x))
-(joy-prim-list (tuck x y) (list y x y))
-(joy-prim (nip x y) y)
-
-;;; Dip combinators
-(joy-prim-void (dip quot x)
-  (if (not (list? quot))
-    (joy-error "dip expects a quotation")
-    (begin
-      (joy-exec quot)
-      (joy-push! x))))
-
-(joy-prim-void (dip2 quot x y)
-  (if (not (list? quot))
-    (joy-error "dip2 expects a quotation")
-    (begin
-      (joy-exec quot)
-      (joy-push! y)
-      (joy-push! x))))
-
-;;; Arithmetic
-(joy-prim (+ x y) (+ x y))
-(joy-prim (- x y) (- x y))
-(joy-prim (* x y) (* x y))
-(joy-prim (/ x y) (/ x y))
-(joy-prim (div x y) (quotient x y))
-(joy-prim (mod x y) (remainder x y))
-(joy-prim (abs x) (abs x))
-(joy-prim (neg x) (- x))
-(joy-prim (sqrt x) (sqrt x))
-(joy-prim (pow x y) (expt x y))
-
-;;; Comparison
-(joy-prim (= x y) (= x y))
-(joy-prim (< x y) (< x y))
-(joy-prim (> x y) (> x y))
-(joy-prim (<= x y) (<= x y))
-(joy-prim (>= x y) (>= x y))
-(joy-prim (not= x y) (not (= x y)))
-
-;;; Predicates
-(joy-prim (zero? x) (= x 0))
-(joy-prim (pos? x) (> x 0))
-(joy-prim (neg? x) (< x 0))
-(joy-prim (odd? x) (odd? x))
-(joy-prim (even? x) (even? x))
-(joy-prim (small? x) (and (integer? x) (< x 100)))
-
-;;; Logical
-(joy-prim (and x y) (and x y))
-(joy-prim (or x y) (or x y))
-(joy-prim (not x) (not x))
-
-;;; Type checking
-(joy-prim (integer? x) (integer? x))
-(joy-prim (boolean? x) (boolean? x))
-(joy-prim (list? x) (list? x))
-(joy-prim (symbol? x) (symbol? x))
-(joy-prim (null? x) (null? x))
-
-;;; List operations
-(joy-prim (cons x y) (cons x y))
-(joy-prim-list (uncons x) (list (car x) (cdr x)))
-(joy-prim (first x) (car x))
-(joy-prim (rest x) (cdr x))
-(joy-prim (length x) (length x))
-(joy-prim (append x y) (append x y))
-(joy-prim (reverse x) (reverse x))
-(joy-prim (second x) (car (cdr x)))
-(joy-prim (third x) (car (cdr (cdr x))))
-
-;;; Helper functions for take and drop
-(define (take n lst)
-  (if (or (zero? n) (null? lst))
-    '()
-    (cons (car lst) (take (- n 1) (cdr lst)))))
-
-(define (drop n lst)
-  (if (or (zero? n) (null? lst))
-    lst
-    (drop (- n 1) (cdr lst))))
-
-(joy-prim (take n lst) (take n lst))
-(joy-prim (drop n lst) (drop n lst))
-(joy-prim (at n lst) (list-ref lst n))
-
-;;; I/O
-(joy-prim-void (print x) (write x) (newline))
-(joy-prim-void (put x) (write x) (display " "))
-
-;;; =============================================================================
-;;; MARK: Quotation Combinators
-;;; =============================================================================
-
-;;; Execute a quotation on top of the stack
-(joy-prim-void (i quot)
-  (if (list? quot)
-    (joy-exec quot)
-    (joy-error "i expects a quotation")))
-
-;;; Conditional execution: run one of two quotations based on test result
-(joy-prim-void (ifte test then-branch else-branch)
-  (if (not (and (list? then-branch) (list? else-branch)))
-    (joy-error "ifte expects two quotations")
-    (begin
-      (joy-push! test)
-      (joy-exec '(i))
-      (let ((condition (joy-pop!)))
-        (if condition
-          (joy-exec then-branch)
-          (joy-exec else-branch))))))
-
-;;; Apply a quotation to each item in a list, collecting results
-(joy-prim-void (map quot lst)
-  (if (not (list? quot))
-    (joy-error "map expects a quotation")
-    (joy-push! (map (lambda (x)
-                      (joy-push! x)
-                      (joy-exec quot)
-                      (joy-pop!))
-                 lst))))
-
-;;; Apply a quotation to filter a list based on truthy result
-(joy-prim-void (filter quot lst)
-  (if (not (list? quot))
-    (joy-error "filter expects a quotation")
-    (joy-push! (filter (lambda (x)
-                         (joy-push! x)
-                         (joy-exec quot)
-                         (joy-pop!))
-                 lst))))
-
-;;; Reduce a list using a quotation and an initial value
-(joy-prim-void (fold quot init lst)
-  (if (not (list? quot))
-    (joy-error "fold expects a quotation")
-    (joy-push! (fold-left (lambda (acc x)
-                            (joy-push! acc)
-                            (joy-push! x)
-                            (joy-exec quot)
-                            (joy-pop!))
-                 init
-                 lst))))
-
-;;; Execute a quotation n times
-(joy-prim-void (times quot n)
-  (if (not (list? quot))
-    (joy-error "times expects a quotation")
-    (let loop ((count n))
-      (when (> count 0)
-        (joy-exec quot)
-        (loop (- count 1))))))
-
-;;; Repeatedly execute body while test quotation evaluates true
-(joy-prim-void (while test-quot body-quot)
-  (if (not (and (list? test-quot) (list? body-quot)))
-    (joy-error "while expects two quotations")
-    (let loop ()
-      (joy-exec test-quot)
-      (when (joy-pop!)
-        (joy-exec body-quot)
-        (loop)))))
-
-;;; Apply a quotation to each item in a list (like for-each)
-(joy-prim-void (step quot lst)
-  (if (not (list? quot))
-    (joy-error "step expects a quotation")
-    (for-each (lambda (x)
-                (joy-push! x)
-                (joy-exec quot))
-      lst)))
-
-;;; Execute one of two quotations based on boolean condition
-(joy-prim-void (branch condition then-branch else-branch)
-  (if (not (and (list? then-branch) (list? else-branch)))
-    (joy-error "branch expects two quotations")
-    (if condition
-      (joy-exec then-branch)
-      (joy-exec else-branch))))
-
-;;; Evaluate a quotation in isolation and push its result
-(joy-prim-void (nullary quot)
-  (if (not (list? quot))
-    (joy-error "nullary expects a quotation")
-    (let ((saved-stack joy-stack))
-      (joy-exec quot)
-      (let ((result (joy-pop!)))
-        (set! joy-stack saved-stack)
-        (joy-push! result)))))
-
-;;; Apply a quotation to a copy of the top stack item and restore original
-(joy-prim-void (unary quot x)
-  (if (not (list? quot))
-    (joy-error "unary expects a quotation")
-    (let ((saved-stack joy-stack))
-      (set! joy-stack (list x))
-      (joy-exec quot)
-      (let ((result (joy-pop!)))
-        (set! joy-stack saved-stack)
-        (joy-push! x)
-        (joy-push! result)))))
-
-;;; Apply a quotation to the top two stack items, restore originals, and push result
-(joy-prim-void (binary quot x y)
-  (if (not (list? quot))
-    (joy-error "binary expects a quotation")
-    (let ((saved-stack joy-stack))
-      (set! joy-stack (list y x))
-      (joy-exec quot)
-      (let ((result (joy-pop!)))
-        (set! joy-stack saved-stack)
-        (joy-push! y)
-        (joy-push! x)
-        (joy-push! result)))))
-
-;;; =============================================================================
-;;; MARK: Result-type Error Handling
-;;; =============================================================================
-
-(joy-define ok [ok] cons)
-(joy-define error [error] cons)
-(joy-define is-ok? first [ok] =)
-(joy-define is-error? first [error] =)
-(joy-define unwrap-ok rest first)
-(joy-define unwrap-error rest first)
-
-(joy-define safe-div
-  [0 =]
-  [pop "Division by zero" error]
-  [/ ok]
-  ifte)
-
-;;; Execute a quotation and wrap result in [ok ...] or [error ...]
-(joy-prim-void (try-exec quot)
-  (if (not (list? quot))
-    (joy-error "try-exec expects a quotation")
-    (guard (ex (else (joy-push! `[error ,(condition-message ex)])))
-      (joy-exec quot)
-      (let ((result (joy-pop!)))
-        (joy-push! `[ok ,result])))))
-
-(joy-define result-bind
-  [is-error?]
-  []
-  [unwrap-ok swap i]
-  ifte)
-
-(joy-define result-map
-  [is-error?]
-  []
-  [unwrap-ok swap i ok]
-  ifte)
-
-(joy-define result-chain
-  [null?]
-  []
-  [uncons swap result-bind result-chain]
-  ifte)
-
-;;; =============================================================================
-;;; MARK: Assorted Joy Definitions
-;;; =============================================================================
-
-(joy-define square dup *)
-(joy-define cube dup dup * *)
-(joy-define twice dup +)
-(joy-define factorial [1 =] [pop 1] [dup 1 - factorial *] ifte)
-(joy-define sum 0 [+] fold)
-(joy-define product 1 [*] fold)
-(joy-define max [>] [swap] [] ifte)
-(joy-define min [<] [swap] [] ifte)
-
-(joy-define range [0 =] [pop []] [dup 1 - range cons] ifte)
-
-(joy-define safe-sqrt
-  [0 <]
-  ["Negative square root" error]
-  [sqrt ok]
-  ifte)
-
-(joy-define parse-int
-  [integer?]
-  [ok]
-  ["Not an integer" error]
-  ifte)
-
-;;; =============================================================================
-;;; MARK: REPL
-;;; =============================================================================
-
-;;; Start the Joy interactive shell (REPL)
-(define (joy-repl)
-  (let ((expr (joy-read-line)))
-    (cond
-      ((eof-object? expr)
-        (display "Goodbye.\n"))
-      (else
-        (guard (ex (else (display "Error: ") (display (condition-message ex)) (newline)))
-          (joy-exec expr)
-          (joy-print-stack))
-        (joy-repl)))))
-
-(joy-prim-void (help)
-  (for-each (lambda (x) (display x) (newline))
-    '("Joy Interpreter Commands:"
-       "  Stack: dup pop swap rot rollup rolldown size clear"
-       "  Arithmetic: + - * / div mod abs neg sqrt pow"
-       "  Comparison: = < > <= >= not="
-       "  Logical: and or not"
-       "  Lists: cons uncons first rest length append reverse"
-       "  Quotations: i ifte map filter fold times while"
-       "  Types: integer? boolean? list? symbol? null?"
-       "  I/O: print put"
-       "  Examples: square cube factorial sum product"
-       "  Use [ ] for quotations, e.g., [1 2 3] [dup *] map")))
-
-;;; Entry point logic
-(let ((args (command-line-arguments)))
-  (cond
-    ((null? args)
-     ;; Default to interactive REPL if stdin is a TTY (roughly)
-     ;; For simplicity, we just check if there's any input to read
-     (display "Joy Interpreter. Type 'help' for commands.\n")
-     (joy-repl))
-    (else
-     ;; In script mode, we could load files, but for now just run
-     ;; This part can be expanded later
-     (joy-repl))))
+        (else
+         (let* ((filename (car args))
+                (in (if (string=? filename "-") (current-input-port) (open-input-file filename))))
+           (let loop ((chars '()))
+             (let ((c (read-char in)))
+               (if (eof-object? c)
+                   (begin
+                     (unless (string=? filename "-") (close-input-port in))
+                     (let ((res (joy-exec (joy-tokenize (list->string (reverse chars))))))
+                       (if (joy-err? res)
+                           (begin (display "ERROR: ") (display (joy-res-val res)) (newline))
+                           (joy-print-stack))))
+                   (loop (cons c chars)))))))))
